@@ -715,6 +715,10 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         self.llm_times.append(time.perf_counter() - llm_start_time)
         logits = self.request.get_tensor("logits").data
         hidden_states = self.request.get_tensor("hidden_states").data
+        # Specific slice for NPU
+        if hidden_states.shape[1] != 1:
+            hidden_states = hidden_states[:, -1 * inputs_embeds.shape[1]:, :]
+
         logits = torch.from_numpy(logits).to(self.device)
         hidden_states = torch.from_numpy(hidden_states).to(self.device)
         past_key_values = ((),)
@@ -1202,6 +1206,7 @@ class OVQwen2_5OmniModel(GenerationMixin):
             thinker_kwargs["streamer"] = stream_config
         print("[===start thinker===]")
         thinker_result = self.thinker.generate(input_ids=input_ids, **thinker_kwargs)
+        print(f"[Thinker][LLM] Input Shape: {input_ids.shape}")
 
         llm_thinker_times = self.thinker.llm_times
         print(f"[Thinker][LLM_Prefill][{self.thinker_infer_device}] Infer time: {llm_thinker_times[0]*1000} ms")
@@ -1270,6 +1275,7 @@ class OVQwen2_5OmniModel(GenerationMixin):
         if "attention_mask" in kwargs:
             talker_attention_mask = torch.cat([kwargs["attention_mask"], kwargs["attention_mask"].new_ones((1, 2))], dim=1).to(self.talker.device)
         print("[===start talker===]")
+        print(f"[Talker][LLM] Input Shape: {talker_input_ids.shape}")
         talker_result = self.talker.generate(
             input_ids=talker_input_ids,
             input_text_ids=talker_input_text_ids,
@@ -1280,9 +1286,6 @@ class OVQwen2_5OmniModel(GenerationMixin):
             **{k: (v.to(self.talker.device) if torch.is_tensor(v) else v) for k, v in talker_kwargs.items()},
         )
         talker_generate_codes = talker_result[:, talker_input_ids.shape[1] : -1]
-
-        print(f"[Talker][LLM] Input Shape: {talker_input_ids.shape}")
-        print(f"[Talker][LLM] Output Shape: {talker_result.shape}")
         print(f"[Talker][LLM] Generate Shape: {talker_generate_codes.shape}")
 
         llm_talker_times = self.talker.llm_times
@@ -1321,11 +1324,13 @@ class OVQwen2_5OmniModel(GenerationMixin):
         if sway_coefficient is not None:
             time_embedding += sway_coefficient * (torch.cos(torch.pi / 2 * time_embedding) - 1 + time_embedding)
 
+        print(f"[Token2wav][Model_ID_0][hidden_states] Shape {initial_state.shape}")
         ode_solver = RungeKutta4ODESolver(function=ode_function, initial_value=initial_state)
         solution_trajectory = ode_solver.integrate(time_embedding)
 
         generated_waveform = solution_trajectory[-1]
         generated_mel_spectrogram = generated_waveform.permute(0, 2, 1)
+        print(f"[Token2wav][Model_ID_1][mel_spectrogram] Shape {generated_mel_spectrogram.shape}")
         token2wav_bigvgan_start_time = time.perf_counter()
         waveform = torch.from_numpy(self.token2wav_bigvgan([generated_mel_spectrogram])[0])
         print(f"[Token2wav][Model_ID_1][{self.token2wav_infer_device}] token2wav_bigvgan infer time: {(time.perf_counter() - token2wav_bigvgan_start_time)*1000} ms")
