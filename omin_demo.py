@@ -7,6 +7,7 @@ from qwen_omni_utils import process_mm_info
 from pathlib import Path
 
 import data_preprocess_helper as preprocess
+import soundfile as sf
 
 conversation = [
     {
@@ -35,6 +36,8 @@ thinker_device = "GPU"
 talker_device = "GPU"
 token2wav_device = "CPU"
 
+enable_talker = False
+
 model_id = "Qwen/Qwen2.5-Omni-7B-INT4-SYM"
 model_dir = Path(model_id.split("/")[-1])
 
@@ -52,8 +55,15 @@ inputs = processor(text=text, audio=audios, images=images, videos=videos, return
 preprocess.dump_inputs_info(inputs)
 
 print("=== Compile And Load Models ===")
-ov_model = OVQwen2_5OmniModel(model_dir, thinker_device=thinker_device, talker_device=talker_device, token2wav_device=token2wav_device, enable_talker=False)
+ov_model = OVQwen2_5OmniModel(model_dir, thinker_device=thinker_device, talker_device=talker_device, token2wav_device=token2wav_device, enable_talker=enable_talker)
 
-text_ids = ov_model.generate(
-    **inputs, stream_config=TextStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True), return_audio=False, thinker_max_new_tokens=1024
-)
+if not enable_talker:
+    text_ids = ov_model.generate(
+        **inputs, stream_config=TextStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True), return_audio=enable_talker, thinker_max_new_tokens=1024
+    )
+else:
+    text_ids, audio = ov_model.generate(
+        **inputs, stream_config=TextStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True), return_audio=enable_talker, thinker_max_new_tokens=1024
+    )
+
+    sf.write("outputs/output.wav", audio.reshape(-1).detach().cpu().numpy(), samplerate=24000)

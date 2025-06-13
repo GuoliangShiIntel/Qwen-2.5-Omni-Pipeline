@@ -1,5 +1,6 @@
 from pathlib import Path
 import openvino as ov
+import time
 
 from openvino.frontend.pytorch.patch_model import __make_16bit_traceable
 import numpy as np
@@ -292,6 +293,7 @@ def get_rope_index(
 
 class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
     def __init__(self, model_dir, device, config):
+        self.infer_device = device
         self.model = core.read_model(model_dir / THINKER_LANGUAGE_NAME)
         self.input_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.inputs)}
         self.output_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.outputs)}
@@ -353,6 +355,7 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         self._supports_cache_class = True
         self._supports_static_cache = True
 
+        self.llm_times = []
         class Qwen2_5_VisionRotaryEmbedding(torch.nn.Module):
             def __init__(self, dim: int, theta: float = 10000.0) -> None:
                 super().__init__()
@@ -489,7 +492,9 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         return window_index, cu_window_seqlens
 
     def visual(self, pixel_values, grid_thw, **kwargs):
-        hidden_states = self.visual_patcher(pixel_values)[0]
+        visual_patcher_start_time = time.perf_counter()
+        hidden_states = self.visual_patcher(pixel_values)[0] # [Thinker][Vision][Modle ID 0]
+        print(f"[Thinker][Vision_ID_0][CPU] visual patcher infer time: {(time.perf_counter() - visual_patcher_start_time)*1000} ms")
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
         window_index, cu_window_seqlens = self.get_window_index(grid_thw)
         cu_window_seqlens = torch.tensor(
@@ -513,7 +518,9 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
 
         window_causal_mask.masked_fill_(torch.logical_not(window_attention_mask), float("-inf"))
 
-        res = self.visual_merger([hidden_states, causal_mask, window_causal_mask, window_index, rotary_pos_emb])[0]
+        visual_merger_start_time = time.perf_counter()
+        res = self.visual_merger([hidden_states, causal_mask, window_causal_mask, window_index, rotary_pos_emb])[0] # [Thinker][Vision][Modle ID 1]
+        print(f"[Thinker][Vision_ID_1][{self.infer_device}] visual merger infer time: {(time.perf_counter() - visual_merger_start_time)*1000} ms")
         return torch.from_numpy(res)
 
     def __call__(
@@ -631,7 +638,7 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
         if inputs_embeds is None:
             # 1. Extract the input embeddings
-            inputs_embeds = torch.from_numpy(self.embed_tokens(input_ids)[0])
+            inputs_embeds = torch.from_numpy(self.embed_tokens(input_ids)[0]) # [Thinker][Text][Modle ID 0]
         if input_ids is not None and input_ids.shape[1] != 1:  # Prefill stage
             if input_features is not None:
                 audio_feat_lengths, audio_output_lengths = self._get_feat_extract_output_lengths(
@@ -654,14 +661,20 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
                 padded_feature, padded_mask, padded_mask_after_cnn = self.padded_and_mask_function(
                     chunk_list, chunk_lengths, padding_value=0, padding_side="right"
                 )
-                padded_embed = torch.from_numpy(self.audio_embed([padded_feature, padded_mask])[0])
+                audio_embed_start_time = time.perf_counter()
+                padded_embed = torch.from_numpy(self.audio_embed([padded_feature, padded_mask])[0]) # [Thinker][Audio][Modle ID 0]
+                print(f"[Thinker][Audio_ID_0][{self.infer_device}] audio embed infer time: {(time.perf_counter() - audio_embed_start_time)*1000} ms")
                 hidden_states = padded_embed[padded_mask_after_cnn.bool()]
                 
-                hidden_states = torch.from_numpy(self.audio([hidden_states, padded_mask_after_cnn])[0])
+                audio_start_time = time.perf_counter()
+                hidden_states = torch.from_numpy(self.audio([hidden_states, padded_mask_after_cnn])[0]) # [Thinker][Audio][Modle ID 1]
+                print(f"[Thinker][Audio_ID_1][{self.infer_device}] audio infer time: {(time.perf_counter() - audio_start_time)*1000} ms")
                 hidden_states_list = hidden_states.split(audio_feat_lengths.tolist(), dim=0)
                 token_audio_list = []
                 for each_audio_states in hidden_states_list:
-                    each_audio_states = torch.from_numpy(self.audio_state([each_audio_states])[0])
+                    audio_state_start_time = time.perf_counter()
+                    each_audio_states = torch.from_numpy(self.audio_state([each_audio_states])[0]) # [Thinker][Audio][Modle ID 2]
+                    print(f"[Thinker][Audio_ID_2][{self.infer_device}] audio_state infer time: {(time.perf_counter() - audio_state_start_time)*1000} ms")
                     token_audio_list.append(each_audio_states)
                 audio_features = torch.cat(token_audio_list, dim=0)
 
@@ -696,8 +709,10 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         inputs["position_ids"] = position_ids
         if "beam_idx" in self.input_names:
             inputs["beam_idx"] = self.next_beam_idx if self.next_beam_idx is not None else np.arange(inputs_embeds.shape[0], dtype=int)
+        llm_start_time = time.perf_counter()
         self.request.start_async(inputs, share_inputs=True)
         self.request.wait()
+        self.llm_times.append(time.perf_counter() - llm_start_time)
         logits = self.request.get_tensor("logits").data
         hidden_states = self.request.get_tensor("hidden_states").data
         logits = torch.from_numpy(logits).to(self.device)
@@ -789,6 +804,8 @@ class OVQwen2_5OmniTalkerForConditionalGeneration(GenerationMixin):
 
         self.spatial_merge_size = self.config.spatial_merge_size
 
+        self.llm_times = []
+
     def can_generate(self):
         """Returns True to validate the check that the model using `GenerationMixin.generate()` can indeed generate."""
         return True
@@ -879,8 +896,10 @@ class OVQwen2_5OmniTalkerForConditionalGeneration(GenerationMixin):
         inputs["position_ids"] = position_ids
         if "beam_idx" in self.input_names:
             inputs["beam_idx"] = self.next_beam_idx if self.next_beam_idx is not None else np.arange(inputs_embeds.shape[0], dtype=int)
+        llm_start_time = time.perf_counter()
         self.request.start_async(inputs, share_inputs=True)
         self.request.wait()
+        self.llm_times.append(time.perf_counter() - llm_start_time)
         logits = self.request.get_tensor("logits").data
         logits = torch.from_numpy(logits).to(self.device)
         past_key_values = ((),)
@@ -1035,6 +1054,9 @@ class RungeKutta4ODESolver:
 class OVQwen2_5OmniModel(GenerationMixin):
     def __init__(self, model_dir, thinker_device, talker_device, token2wav_device, enable_talker):
         self.config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+        self.thinker_infer_device = thinker_device
+        self.talker_infer_device = talker_device
+        self.token2wav_infer_device = token2wav_device
 
         self.has_talker = enable_talker
         model_path = Path(model_dir)
@@ -1181,6 +1203,12 @@ class OVQwen2_5OmniModel(GenerationMixin):
         print("[===start thinker===]")
         thinker_result = self.thinker.generate(input_ids=input_ids, **thinker_kwargs)
 
+        llm_thinker_times = self.thinker.llm_times
+        print(f"[Thinker][LLM_Prefill][{self.thinker_infer_device}] Infer time: {llm_thinker_times[0]*1000} ms")
+        remaining_list = llm_thinker_times[1:]
+        average = sum(remaining_list) / len(remaining_list)
+        print(f"[Thinker][LLM_KV_CACHE][{self.thinker_infer_device}] Infer: {1 / average} token/s")
+
         if not generate_audio:
             return thinker_result
 
@@ -1253,6 +1281,16 @@ class OVQwen2_5OmniModel(GenerationMixin):
         )
         talker_generate_codes = talker_result[:, talker_input_ids.shape[1] : -1]
 
+        print(f"[Talker][LLM] Input Shape: {talker_input_ids.shape}")
+        print(f"[Talker][LLM] Output Shape: {talker_result.shape}")
+        print(f"[Talker][LLM] Generate Shape: {talker_generate_codes.shape}")
+
+        llm_talker_times = self.talker.llm_times
+        print(f"[Talker][LLM_Prefill][{self.talker_infer_device}] Infer time: {llm_talker_times[0]*1000} ms")
+        remaining_list = llm_talker_times[1:]
+        average = sum(remaining_list) / len(remaining_list)
+        print(f"[Talker][LLM_KV_CACHE][{self.talker_infer_device}] Infer: {1 / average} token/s")
+
         print("[===start token2wav===]")
         # 3. Generate wavs from code
         reference_mel_spectrogram = speaker_params["ref_mel"].to(torch.device("cpu")).float()
@@ -1268,9 +1306,11 @@ class OVQwen2_5OmniModel(GenerationMixin):
         sway_coefficient = -1.0
 
         def ode_function(time_step, hidden_states):
+            token2wav_dit_start_time = time.perf_counter()
             model_output = torch.from_numpy(
                 self.token2wav_dit([hidden_states, reference_mel_spectrogram, conditioning_vector, talker_generate_codes, time_step])[0]
             )
+            print(f"[Token2wav][Model_ID_0][{self.token2wav_infer_device}] token2wav_dit infer time: {(time.perf_counter() - token2wav_dit_start_time)*1000} ms")
             guided_prediction, null_prediction = torch.chunk(model_output, 2, dim=0)
 
             return guided_prediction + (guided_prediction - null_prediction) * guidance_scale
@@ -1286,6 +1326,8 @@ class OVQwen2_5OmniModel(GenerationMixin):
 
         generated_waveform = solution_trajectory[-1]
         generated_mel_spectrogram = generated_waveform.permute(0, 2, 1)
+        token2wav_bigvgan_start_time = time.perf_counter()
         waveform = torch.from_numpy(self.token2wav_bigvgan([generated_mel_spectrogram])[0])
+        print(f"[Token2wav][Model_ID_1][{self.token2wav_infer_device}] token2wav_bigvgan infer time: {(time.perf_counter() - token2wav_bigvgan_start_time)*1000} ms")
         waveform.squeeze().cpu()
         return thinker_result.sequences, waveform.float()
