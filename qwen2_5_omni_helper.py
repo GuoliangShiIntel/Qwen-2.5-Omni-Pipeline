@@ -685,13 +685,46 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
                 inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
 
             if pixel_values is not None:
-                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                num_images = image_grid_thw.shape[0]
+                current_index = 0
+                results = []
+                for i in range(num_images):
+                    h = image_grid_thw[i][1].item()
+                    w = image_grid_thw[i][2].item()
+                    image_size = h * w
+                    start = current_index
+                    end = start + image_size
+                    image_pixels = pixel_values[start:end]
+
+                    image_embed = self.visual(image_pixels, grid_thw=image_grid_thw[i:i+1, :])
+                    results.append(image_embed)
+
+                    current_index = end
+
+                image_embeds = torch.cat(results, dim=0)
+
+                # image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
                 image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
                 image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
             if pixel_values_videos is not None:
-                video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+                num_images = video_grid_thw[0][0].item()
+                video_grid_thw[0][0] = 1
+                h = video_grid_thw[0][1].item()
+                w = video_grid_thw[0][2].item()
+                image_size = h * w
+                results = []
+                for i in range(num_images):
+                    start = i * image_size
+                    end = start + image_size
+                    pixel_values_video = pixel_values_videos[start:end]
+                    video_embed = self.visual(pixel_values_video, grid_thw=video_grid_thw)
+                    results.append(video_embed)
+
+                video_embeds = torch.cat(results, dim=0)
+
+                # video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
                 video_mask = (input_ids == self.config.video_token_index).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
                 video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
