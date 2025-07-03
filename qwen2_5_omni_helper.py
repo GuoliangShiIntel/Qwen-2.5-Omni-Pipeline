@@ -493,7 +493,9 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
 
     def visual(self, pixel_values, grid_thw, **kwargs):
         visual_patcher_start_time = time.perf_counter()
+        # print(f"[Thinker][Vision][Modle ID 0][Inputs]: pixel_values: {pixel_values.shape}")
         hidden_states = self.visual_patcher(pixel_values)[0] # [Thinker][Vision][Modle ID 0]
+        # print(f"[Thinker][Vision][Modle ID 0][Outputs]: hidden_states: {hidden_states.shape}")
         print(f"[Thinker][Vision_ID_0][CPU] visual patcher infer time: {(time.perf_counter() - visual_patcher_start_time)*1000} ms")
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
         window_index, cu_window_seqlens = self.get_window_index(grid_thw)
@@ -519,7 +521,10 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         window_causal_mask.masked_fill_(torch.logical_not(window_attention_mask), float("-inf"))
 
         visual_merger_start_time = time.perf_counter()
+        # print(f"[Thinker][Vision][Modle ID 1][Inputs]: hidden_states: {hidden_states.shape}, causal_mask: {causal_mask.shape}, window_causal_mask: {window_causal_mask.shape}")
+        # print(f"[Thinker][Vision][Modle ID 1][Inputs]: window_index: {window_index.shape}, rotary_pos_emb: {rotary_pos_emb.shape}")
         res = self.visual_merger([hidden_states, causal_mask, window_causal_mask, window_index, rotary_pos_emb])[0] # [Thinker][Vision][Modle ID 1]
+        # print(f"[Thinker][Vision][Modle ID 1][Outputs]: hidden_states: {res.shape}")
         print(f"[Thinker][Vision_ID_1][{self.infer_device}] visual merger infer time: {(time.perf_counter() - visual_merger_start_time)*1000} ms")
         return torch.from_numpy(res)
 
@@ -662,18 +667,24 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
                     chunk_list, chunk_lengths, padding_value=0, padding_side="right"
                 )
                 audio_embed_start_time = time.perf_counter()
+                # print(f"[Thinker][Audio][Modle ID 0][Inputs]: padded_feature: {padded_feature.shape}, padded_mask: {padded_mask.shape}")
                 padded_embed = torch.from_numpy(self.audio_embed([padded_feature, padded_mask])[0]) # [Thinker][Audio][Modle ID 0]
+                # print(f"[Thinker][Audio][Modle ID 0][Outputs]: padded_embed: {padded_embed.shape}")
                 print(f"[Thinker][Audio_ID_0][{self.infer_device}] audio embed infer time: {(time.perf_counter() - audio_embed_start_time)*1000} ms")
-                hidden_states = padded_embed[padded_mask_after_cnn.bool()]
+                hidden_states = padded_embed[padded_mask_after_cnn]
                 
                 audio_start_time = time.perf_counter()
+                # print(f"[Thinker][Audio][Modle ID 1][Inputs]: hidden_states: {hidden_states.shape}, padded_mask_after_cnn: {padded_mask_after_cnn.shape}")
                 hidden_states = torch.from_numpy(self.audio([hidden_states, padded_mask_after_cnn])[0]) # [Thinker][Audio][Modle ID 1]
+                # print(f"[Thinker][Audio][Modle ID 1][Outputs]: hidden_states: {hidden_states.shape}")
                 print(f"[Thinker][Audio_ID_1][{self.infer_device}] audio infer time: {(time.perf_counter() - audio_start_time)*1000} ms")
                 hidden_states_list = hidden_states.split(audio_feat_lengths.tolist(), dim=0)
                 token_audio_list = []
                 for each_audio_states in hidden_states_list:
                     audio_state_start_time = time.perf_counter()
+                    # print(f"[Thinker][Audio][Modle ID 2][Inputs]: each_audio_states: {each_audio_states.shape}")
                     each_audio_states = torch.from_numpy(self.audio_state([each_audio_states])[0]) # [Thinker][Audio][Modle ID 2]
+                    # print(f"[Thinker][Audio][Modle ID 2][Outputs]: each_audio_states: {each_audio_states.shape}")
                     print(f"[Thinker][Audio_ID_2][{self.infer_device}] audio_state infer time: {(time.perf_counter() - audio_state_start_time)*1000} ms")
                     token_audio_list.append(each_audio_states)
                 audio_features = torch.cat(token_audio_list, dim=0)

@@ -1,6 +1,8 @@
 from PIL import Image
 import math
 import numpy as np
+import torch
+import os
 
 def resize_audio_for_npu(audios, npu_static_length=163839):
     """
@@ -119,24 +121,123 @@ def resize_images_for_gpu(images, patch_size=14, target_patch_size_each_img=2048
 
     return processed_images
 
+def resize_videos_for_gpu(video_list, patch_size=14, target_patch_size_each_frame=2048):
+    """
+    Resize a video for GPU processing by maintaining aspect ratio.
+
+    Args:
+        video_list (list of torch.Tensor | None): List containing a single video tensor with shape (frames, channels, height, width).
+        patch_size (int): Size of each patch.
+        target_patch_size_each_frame (int): Target patch size for each frame.
+
+    Returns:
+        list of torch.Tensor | None: List containing the processed video tensor or None if input is None.
+    """
+    if video_list is None or len(video_list) == 0:
+        return None
+    
+    video = video_list[0]
+    frames, channels, H, W = video.shape
+    processed_frames = []
+
+    max_product = target_patch_size_each_frame * (patch_size ** 2)
+    current_product = H * W
+    
+    scale = math.sqrt(max_product / current_product)
+    scale = min(scale, 1.0)
+    
+    new_H = int(round(H * scale))
+    new_W = int(round(W * scale))
+    
+    for i in range(frames):
+        frame = video[i].permute(1, 2, 0).numpy().astype(np.uint8)  # Convert to HWC format and ensure type is uint8
+        img = Image.fromarray(frame)
+        resized_img = img.resize((new_W, new_H), Image.Resampling.LANCZOS)
+        processed_frames.append(torch.from_numpy(np.array(resized_img)).permute(2, 0, 1))  # Convert back to CHW format
+        
+        print(f"Resize frame {i+1}/{frames}: {W}x{H} -> {new_W}x{new_H} with patch number {round(new_W*new_H/(patch_size ** 2))}")
+    
+    processed_video = torch.stack(processed_frames, dim=0)  # Stack frames back to video
+    return [processed_video]
+
+def resize_videos_for_npu(video_list, patch_size=14, target_patch_size_each_frame=2048):
+    """
+    Resize a video for GPU processing by maintaining aspect ratio.
+
+    Args:
+        video_list (list of torch.Tensor | None): List containing a single video tensor with shape (frames, channels, height, width).
+        patch_size (int): Size of each patch.
+        target_patch_size_each_frame (int): Target patch size for each frame.
+
+    Returns:
+        list of torch.Tensor | None: List containing the processed video tensor or None if input is None.
+    """
+    if video_list is None or len(video_list) == 0:
+        return None
+    
+    video = video_list[0]
+    frames, channels, orig_height, orig_width = video.shape
+    processed_frames = []
+
+    orig_ratio = orig_width / orig_height
+
+    factor_pairs = [(2 ** i, 2048 // (2 ** i)) for i in range(12)]  # Generate factor pairs from 2^0 to 2^11
+
+    min_diff = float('inf')
+    best_a, best_b = 1, target_patch_size_each_frame
+    for a, b in factor_pairs:
+        current_ratio = b / a
+        diff = abs(current_ratio - orig_ratio)
+        if diff < min_diff:
+            min_diff = diff
+            best_a, best_b = a, b
+
+    target_width = patch_size * best_b
+    target_height = patch_size * best_a
+
+    scale = min(target_width / orig_width, target_height / orig_height)
+    new_W = int(round(orig_width * scale))
+    new_H = int(round(orig_height * scale))
+    
+    for i in range(frames):
+        frame = video[i].permute(1, 2, 0).numpy().astype(np.uint8)  # Convert to HWC format and ensure type is uint8
+        img = Image.fromarray(frame)
+        resized_img = img.resize((new_W, new_H), Image.Resampling.LANCZOS)
+
+        new_img = Image.new("RGB", (target_width, target_height), (0, 0, 0))
+        new_img.paste(resized_img, (0, 0))
+
+        processed_frames.append(torch.from_numpy(np.array(new_img)).permute(2, 0, 1))  # Convert back to CHW format
+        
+        # Save the frame to the output folder
+        frame_filename = os.path.join('inputs/video_imgs', f"frame_{i+1:04d}.png")
+        new_img.save(frame_filename)
+
+        print(f"Resize frame {i+1}/{frames}: {orig_width}x{orig_height} -> {new_W}x{new_H} ({target_width}x{target_height}) with patch number {round(target_width*target_height/(patch_size ** 2))}")
+    
+    processed_video = torch.stack(processed_frames, dim=0)  # Stack frames back to video
+    return [processed_video]
+
 def resize_inputs(audios, images, videos, audio_len, img_patch_size, patch_length_per_img, device):
     if device == "NPU":
         audios = resize_audio_for_npu(audios, npu_static_length = audio_len)
         images = resize_image_for_npu(images, patch_size = img_patch_size, npu_static_patch_length = patch_length_per_img)
+        videos = resize_videos_for_npu(videos, patch_size=img_patch_size, target_patch_size_each_frame = patch_length_per_img)
 
     if device != "NPU":
         images = resize_images_for_gpu(images, patch_size=img_patch_size, target_patch_size_each_img = patch_length_per_img)
+        videos = resize_videos_for_gpu(videos, patch_size=img_patch_size, target_patch_size_each_frame = patch_length_per_img)
 
     return audios, images, videos
 
 def dump_inputs_info(inputs):
     print("=== Inputs Informations ===")
-    # print(f"key values: {inputs.keys()}")
-    # for key, value in inputs.items():
-    #     print(f"\n{key} shape: {value.shape}")
-    #     if hasattr(value, 'dtype'):
-    #         print(f"{key} type: {value.dtype}")
-    #     print(f"{key} value: {value}")
+    print(f"key values: {inputs.keys()}")
+    for key, value in inputs.items():
+        print(f"\n{key} shape: {value.shape}")
+        if hasattr(value, 'dtype'):
+            print(f"{key} type: {value.dtype}")
+        print(f"{key} value: {value}")
 
     if 'input_ids' in inputs:
         print(f"Total token length for Thinker LLM: {inputs['input_ids'].size(1)}")
@@ -145,4 +246,4 @@ def dump_inputs_info(inputs):
     if 'image_grid_thw' in inputs:
         print(f" - Vision Embedding include: {inputs['image_grid_thw'].size(0)} images")
     if 'feature_attention_mask' in inputs:
-        print(f" - Audio Embedding input length: {inputs['feature_attention_mask'].sum(-1).item()}, output token length: {inputs['feature_attention_mask'].sum(-1).item()/4}")
+        print(f" - Audio Embedding input length: {inputs['feature_attention_mask'].sum(-1)}, output token length: {inputs['feature_attention_mask'].sum(-1)/4}")

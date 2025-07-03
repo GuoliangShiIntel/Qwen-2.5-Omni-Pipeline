@@ -261,6 +261,7 @@ def npu_model_import_or_compile(blob_path, model_path, convert_func, device, mod
         ov.serialize(model, blob_path.parent / ir_name)
         print(f"Start to compile {ir_name}, device: {device}")
         config = {}
+        update_config(config, ("LOG_LEVEL", "LOG_INFO"))
         update_config(config, ("NPU_TILES", "6"))
         model = core.compile_model(model, device, config)
         try:

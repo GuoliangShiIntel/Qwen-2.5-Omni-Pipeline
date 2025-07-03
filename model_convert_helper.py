@@ -326,7 +326,7 @@ def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None, u
             audio,
             example_input={
                 "hidden_states": torch.randn([1, 1280], dtype=torch.float32),
-                "padded_mask_after_cnn": torch.ones([1, 5], dtype=torch.bool),
+                "padded_mask_after_cnn": torch.ones([1, 5], dtype=torch.int64),
             },
         )
         ov.save_model(ov_model, thinker_audio_path)

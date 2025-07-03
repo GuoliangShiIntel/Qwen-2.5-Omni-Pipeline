@@ -32,11 +32,14 @@ conversation = [
     },
 ]
 
+print("=== Compile And Load Models to Device ===")
+
 thinker_device = "GPU"
 talker_device = "GPU"
 token2wav_device = "CPU"
 
 enable_talker = False
+use_audio_in_video = False
 
 model_id = "Qwen/Qwen2.5-Omni-7B-INT4-SYM"
 model_dir = Path(model_id.split("/")[-1])
@@ -47,23 +50,24 @@ print("=== Chat Template ===")
 text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
 print(text)
 
-audios, images, videos = process_mm_info(conversation, use_audio_in_video=False)
+audios, images, videos = process_mm_info(conversation, use_audio_in_video=use_audio_in_video)
 print("=== Resize Inputs ===")
 audios, images, videos = preprocess.resize_inputs(audios, images, videos, audio_len=163839, img_patch_size=14, patch_length_per_img=2048, device=thinker_device)
 
-inputs = processor(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True, use_audio_in_video=False)
+inputs = processor(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True, use_audio_in_video=use_audio_in_video)
+
 preprocess.dump_inputs_info(inputs)
 
-print("=== Compile And Load Models ===")
+print("=== Infer and get Result ===")
 ov_model = OVQwen2_5OmniModel(model_dir, thinker_device=thinker_device, talker_device=talker_device, token2wav_device=token2wav_device, enable_talker=enable_talker)
 
 if not enable_talker:
     text_ids = ov_model.generate(
-        **inputs, stream_config=TextStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True), return_audio=enable_talker, thinker_max_new_tokens=1024
+        **inputs, stream_config=TextStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True), use_audio_in_video=use_audio_in_video, return_audio=enable_talker, thinker_max_new_tokens=1024
     )
 else:
     text_ids, audio = ov_model.generate(
-        **inputs, stream_config=TextStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True), return_audio=enable_talker, thinker_max_new_tokens=1024
+        **inputs, stream_config=TextStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True), use_audio_in_video=use_audio_in_video, return_audio=enable_talker, thinker_max_new_tokens=1024
     )
 
     sf.write("outputs/output.wav", audio.reshape(-1).detach().cpu().numpy(), samplerate=24000)
