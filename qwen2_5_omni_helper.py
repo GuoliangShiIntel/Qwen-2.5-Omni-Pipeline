@@ -1335,21 +1335,21 @@ class OVQwen2_5OmniModel(GenerationMixin):
         )
         talker_generate_codes = talker_result[:, talker_input_ids.shape[1] : -1]
 
-        # Handle NPU device constraints - limit to 512 length and pad if necessary
+        # Handle NPU device constraints - limit to 128 length and pad if necessary
         if self.token2wav_infer_device == 'NPU':
             current_length = talker_generate_codes.shape[1]
-            if current_length > 512:
-                # Slice to 512 if longer
-                talker_generate_codes = talker_generate_codes[:, :512]
-                print(f"[NPU] Sliced talker_generate_codes from {current_length} to 512")
-            elif current_length < 512:
-                # Pad with zeros to align with 512
-                padding_length = 512 - current_length
+            if current_length > 128:
+                # Slice to 128 if longer
+                talker_generate_codes = talker_generate_codes[:, :128]
+                print(f"[NPU] Sliced talker_generate_codes from {current_length} to 128")
+            elif current_length < 128:
+                # Pad with zeros to align with 128
+                padding_length = 128 - current_length
                 padding = torch.zeros((talker_generate_codes.shape[0], padding_length), 
                                     dtype=talker_generate_codes.dtype, 
                                     device=talker_generate_codes.device)
                 talker_generate_codes = torch.cat([talker_generate_codes, padding], dim=1)
-                print(f"[NPU] Padded talker_generate_codes from {current_length} to 512")
+                print(f"[NPU] Padded talker_generate_codes from {current_length} to 128")
 
         print(f"[Talker][LLM] Generate Shape: {talker_generate_codes.shape}")
 

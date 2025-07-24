@@ -127,7 +127,7 @@ def convert_token2wav_dit_to_static_shape(model):
 
         if input_name.startswith("hidden_states"):
             input_shape[0] = 1
-            input_shape[1] = 1024
+            input_shape[1] = 256
             input_shape[2] = 80
         elif input_name.startswith("condition_vector"):
             input_shape[0] = 1
@@ -135,11 +135,11 @@ def convert_token2wav_dit_to_static_shape(model):
             input_shape[2] = 80
         elif input_name.startswith("speaker_embedding"):
             input_shape[0] = 1
-            input_shape[1] = 1024
+            input_shape[1] = 256
             input_shape[2] = 192
         elif input_name.startswith("quantized_code"):
             input_shape[0] = 1
-            input_shape[1] = 512
+            input_shape[1] = 128
 
         shapes[input] = input_shape
 
@@ -159,7 +159,7 @@ def convert_token2wav_bigvgan_to_static_shape(model):
         if input_name.startswith("mel_spectrogram"):
             input_shape[0] = 1
             input_shape[1] = 80
-            input_shape[2] = 1024
+            input_shape[2] = 256
 
         shapes[input] = input_shape
 
