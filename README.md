@@ -31,7 +31,7 @@ This repository contains the pipeline for the Qwen 2.5 Omni 7B model.
 3. Install the required packages:
 
     ```bash
-    pip install "transformers>=4.52.0" "torchvision" "accelerate" "qwen-omni-utils[decord]" "gradio>=4.19" --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu
+    pip install "transformers==4.52.0" "torchvision" "accelerate" "qwen-omni-utils[decord]" "gradio>=4.19" --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu
     pip install "openvino==2025.1.0" "nncf>=2.16.0"
     ```
 

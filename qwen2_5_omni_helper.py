@@ -125,7 +125,11 @@ def get_rope_index(
             input_tokens = input_ids.tolist()
             llm_pos_ids_list: list = []
             st = 0
-            remain_images, remain_videos, remain_audios = image_nums, video_nums, audio_nums
+            remain_images, remain_videos, remain_audios = (
+                image_nums,
+                video_nums,
+                audio_nums,
+            )
             multimodal_nums = image_nums + audio_nums if use_audio_in_video else image_nums + video_nums + audio_nums
             for _ in range(multimodal_nums):
                 st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
@@ -959,10 +963,10 @@ class OVQwen2_5OmniTalkerForConditionalGeneration(GenerationMixin):
             thinker_reply_part=thinker_reply_part,
         )
 
-    def _get_initial_cache_position(self, input_ids, model_kwargs):
+    def _get_initial_cache_position(self, input_ids, device, model_kwargs):
         # Talker needs to calculate cache_position with input_ids, so pop inputs_embeds temporarily
         inputs_embeds = model_kwargs.pop("inputs_embeds")
-        model_kwargs = super()._get_initial_cache_position(input_ids, model_kwargs)
+        model_kwargs = super()._get_initial_cache_position(input_ids, device, model_kwargs)
         model_kwargs["inputs_embeds"] = inputs_embeds
         return model_kwargs
 
@@ -1330,6 +1334,23 @@ class OVQwen2_5OmniModel(GenerationMixin):
             **{k: (v.to(self.talker.device) if torch.is_tensor(v) else v) for k, v in talker_kwargs.items()},
         )
         talker_generate_codes = talker_result[:, talker_input_ids.shape[1] : -1]
+
+        # Handle NPU device constraints - limit to 512 length and pad if necessary
+        if self.token2wav_infer_device == 'NPU':
+            current_length = talker_generate_codes.shape[1]
+            if current_length > 512:
+                # Slice to 512 if longer
+                talker_generate_codes = talker_generate_codes[:, :512]
+                print(f"[NPU] Sliced talker_generate_codes from {current_length} to 512")
+            elif current_length < 512:
+                # Pad with zeros to align with 512
+                padding_length = 512 - current_length
+                padding = torch.zeros((talker_generate_codes.shape[0], padding_length), 
+                                    dtype=talker_generate_codes.dtype, 
+                                    device=talker_generate_codes.device)
+                talker_generate_codes = torch.cat([talker_generate_codes, padding], dim=1)
+                print(f"[NPU] Padded talker_generate_codes from {current_length} to 512")
+
         print(f"[Talker][LLM] Generate Shape: {talker_generate_codes.shape}")
 
         llm_talker_times = self.talker.llm_times

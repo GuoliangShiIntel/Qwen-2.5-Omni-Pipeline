@@ -36,7 +36,7 @@ def resize_audio_for_npu(audios, npu_static_length=163839):
 
 def resize_image_for_npu(imgs, patch_size=14, npu_static_patch_length=2048):
     """
-    Resize image for NPU processing by maintaining aspect ratio and padding.
+    Resize images for NPU processing by maintaining aspect ratio and padding.
 
     Args:
         imgs (list | None): Input image list.
@@ -44,45 +44,47 @@ def resize_image_for_npu(imgs, patch_size=14, npu_static_patch_length=2048):
         npu_static_patch_length (int): The static length for NPU processing.
 
     Returns:
-        list | None: Resized and padded image in a list, or None if input is None.
+        list | None: List of resized and padded images, or None if input is None.
     """
     if imgs is None:
         return None
-    
-    if not isinstance(imgs, list) or len(imgs) != 1:
-        raise ValueError("Only one image supported for NPU. Please set device to GPU")
-    
-    img = imgs[0]
-    
-    orig_width, orig_height = img.size
-    orig_ratio = orig_width / orig_height
 
-    factor_pairs = [(2 ** i, 2048 // (2 ** i)) for i in range(12)]  # Generate factor pairs from 2^0 to 2^11
+    if not isinstance(imgs, list) or len(imgs) == 0:
+        raise ValueError("Input imgs must be a non-empty list.")
 
-    min_diff = float('inf')
-    best_a, best_b = 1, npu_static_patch_length
-    for a, b in factor_pairs:
-        current_ratio = b / a
-        diff = abs(current_ratio - orig_ratio)
-        if diff < min_diff:
-            min_diff = diff
-            best_a, best_b = a, b
+    resized_imgs = []
+    for img in imgs:
+        orig_width, orig_height = img.size
+        orig_ratio = orig_width / orig_height
 
-    target_width = patch_size * best_b
-    target_height = patch_size * best_a
+        factor_pairs = [(2 ** i, npu_static_patch_length // (2 ** i)) for i in range(12)]  # Generate factor pairs
 
-    scale = min(target_width / orig_width, target_height / orig_height)
-    new_width = int(round(orig_width * scale))
-    new_height = int(round(orig_height * scale))
+        min_diff = float('inf')
+        best_a, best_b = 1, npu_static_patch_length
+        for a, b in factor_pairs:
+            current_ratio = b / a
+            diff = abs(current_ratio - orig_ratio)
+            if diff < min_diff:
+                min_diff = diff
+                best_a, best_b = a, b
 
-    resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        target_width = patch_size * best_b
+        target_height = patch_size * best_a
 
-    new_img = Image.new("RGB", (target_width, target_height), (0, 0, 0))
-    new_img.paste(resized_img, (0, 0))
+        scale = min(target_width / orig_width, target_height / orig_height)
+        new_width = int(round(orig_width * scale))
+        new_height = int(round(orig_height * scale))
 
-    print(f"Resize image: {orig_width}x{orig_height} -> {target_width}x{target_height} with patch number {npu_static_patch_length}")
+        resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
-    return [new_img]
+        new_img = Image.new("RGB", (target_width, target_height), (0, 0, 0))
+        new_img.paste(resized_img, (0, 0))
+
+        print(f"Resize image: {orig_width}x{orig_height} -> {target_width}x{target_height} with patch number {npu_static_patch_length}")
+
+        resized_imgs.append(new_img)
+
+    return resized_imgs
 
 
 def resize_images_for_gpu(images, patch_size=14, target_patch_size_each_img=2048):

@@ -20,6 +20,9 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
     ALL_ATTENTION_FUNCTIONS,
     apply_rotary_pos_emb,
 )
+from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
+    Qwen2_5OmniConfig,
+)
 from pathlib import Path
 import types
 from typing import Optional, Union, List
@@ -265,7 +268,12 @@ def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None, u
         if not (Path(output_dir) / "spk_dict.pt").exists():
             hf_hub_download(model_id, filename="spk_dict.pt", local_dir=output_dir)
 
-    model = Qwen2_5OmniForConditionalGeneration.from_pretrained(ckpt, torch_dtype=torch.float16)
+    config = Qwen2_5OmniConfig.from_pretrained(ckpt)
+    config.thinker_config._attn_implementation_autoset = False
+    config.thinker_config._attn_implementation = "sdpa"
+    config.talker_config._attn_implementation_autoset = False
+    config.talker_config._attn_implementation = "sdpa"
+    model = Qwen2_5OmniForConditionalGeneration.from_pretrained(ckpt, config=config, torch_dtype=torch.float16)
     model.eval()
     processor = AutoProcessor.from_pretrained(ckpt)
 
@@ -325,8 +333,8 @@ def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None, u
         ov_model = ov.convert_model(
             audio,
             example_input={
-                "hidden_states": torch.randn([1, 1280], dtype=torch.float32),
-                "padded_mask_after_cnn": torch.ones([1, 5], dtype=torch.int64),
+                "hidden_states": torch.randn([512, 1280], dtype=torch.float32),
+                "padded_mask_after_cnn": torch.ones([6, 100], dtype=torch.int64),
             },
         )
         ov.save_model(ov_model, thinker_audio_path)
@@ -343,8 +351,8 @@ def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None, u
         ov_model = ov.convert_model(
             audio,
             example_input={
-                "padded_feature": torch.randn([1, 128, 9], dtype=torch.float32),
-                "padded_mask": torch.ones([1, 1, 9], dtype=torch.int32)
+                "padded_feature": torch.randn([3, 128, 200], dtype=torch.float32),
+                "padded_mask": torch.ones([3, 1, 200], dtype=torch.int32)
             },
         )
         ov.save_model(ov_model, thinker_audio_embed_path)
@@ -361,7 +369,7 @@ def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None, u
         ov_model = ov.convert_model(
             audio,
             example_input={
-                "each_audio_states": torch.randn([5, 1280], dtype=torch.float32),
+                "each_audio_states": torch.randn([512, 1280], dtype=torch.float32),
             },
         )
         ov.save_model(ov_model, thinker_audio_state_path)
@@ -376,7 +384,10 @@ def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None, u
         vision_embed_tokens = model.thinker.visual
         if not thinker_patcher_path.exists():
             __make_16bit_traceable(vision_embed_tokens.patch_embed)
-            ov_model = ov.convert_model(vision_embed_tokens.patch_embed, example_input={"hidden_states": torch.randn([8, 1176])})
+            ov_model = ov.convert_model(
+                vision_embed_tokens.patch_embed,
+                example_input={"hidden_states": torch.randn([8, 1176])},
+            )
             ov.save_model(ov_model, thinker_patcher_path)
             del ov_model
             cleanup_torchscript_cache()
@@ -401,7 +412,11 @@ def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None, u
                     attention_mask_now = attention_mask
                 else:
                     attention_mask_now = window_attention_mask
-                hidden_states = blk(hidden_states, attention_mask=attention_mask_now, rotary_pos_emb=rotary_pos_emb)
+                hidden_states = blk(
+                    hidden_states,
+                    attention_mask=attention_mask_now,
+                    rotary_pos_emb=rotary_pos_emb,
+                )
 
             hidden_states = self.merger(hidden_states)
             reverse_indices = torch.argsort(window_index)
@@ -409,8 +424,15 @@ def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None, u
 
             return hidden_states
 
-        def sdpa_attn_forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor, rotary_pos_emb: torch.Tensor = None) -> torch.Tensor:
-            from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import apply_rotary_pos_emb_vision
+        def sdpa_attn_forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor,
+            rotary_pos_emb: torch.Tensor = None,
+        ) -> torch.Tensor:
+            from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
+                apply_rotary_pos_emb_vision,
+            )
 
             seq_length = hidden_states.shape[0]
             q = self.q(hidden_states).reshape(seq_length, self.num_heads, -1)
@@ -429,7 +451,11 @@ def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None, u
             return attn_output
 
         def block_forward(self, hidden_states, attention_mask, rotary_pos_emb) -> torch.Tensor:
-            hidden_states = hidden_states + self.attn(self.norm1(hidden_states), attention_mask=attention_mask, rotary_pos_emb=rotary_pos_emb)
+            hidden_states = hidden_states + self.attn(
+                self.norm1(hidden_states),
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+            )
             hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
             return hidden_states
 
@@ -506,7 +532,12 @@ def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None, u
         lang_model.forward = types.MethodType(forward_wrap_thinker, lang_model)
 
         num_pkv = lang_model.model.config.num_hidden_layers
-        pkv_shape = (2, lang_model.model.config.num_key_value_heads, 2, hidden_size // lang_model.model.config.num_attention_heads)
+        pkv_shape = (
+            2,
+            lang_model.model.config.num_key_value_heads,
+            2,
+            hidden_size // lang_model.model.config.num_attention_heads,
+        )
         # input_embeds = torch.randn((1, 1, hidden_size))
         cache_position = torch.arange(2, 4)
         position_ids = cache_position.view(1, 1, -1).expand(3, 2, -1)
@@ -522,14 +553,30 @@ def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None, u
             input_names.extend([f"past_key_values.{i}.key", f"past_key_values.{i}.value"])
             output_names.extend([f"present.{i}.key", f"present.{i}.value"])
         input_names.append("inputs_embeds")
-        example_input = {"inputs_embeds": input_embeds, "attention_mask": attention_mask, "position_ids": position_ids, "past_key_values": past_key_values}
+        example_input = {
+            "inputs_embeds": input_embeds,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "past_key_values": past_key_values,
+        }
 
         input_shapes = [
             ov.PartialShape([-1, -1]),
             ov.PartialShape([3, -1, -1]),
         ]
         input_shapes += (
-            [ov.PartialShape([-1, lang_model.model.config.num_key_value_heads, -1, hidden_size // lang_model.model.config.num_attention_heads])] * 2 * num_pkv
+            [
+                ov.PartialShape(
+                    [
+                        -1,
+                        lang_model.model.config.num_key_value_heads,
+                        -1,
+                        hidden_size // lang_model.model.config.num_attention_heads,
+                    ]
+                )
+            ]
+            * 2
+            * num_pkv
         )
         input_shapes += [ov.PartialShape([-1, -1, input_embeds.shape[-1]])]
         __make_16bit_traceable(lang_model)
@@ -615,7 +662,12 @@ def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None, u
         lang_model.forward = types.MethodType(forward_wrap_talker, lang_model)
 
         num_pkv = lang_model.model.config.num_hidden_layers
-        pkv_shape = (2, lang_model.model.config.num_key_value_heads, 2, lang_model.model.config.head_dim)
+        pkv_shape = (
+            2,
+            lang_model.model.config.num_key_value_heads,
+            2,
+            lang_model.model.config.head_dim,
+        )
         # input_embeds = torch.randn((1, 1, hidden_size))
         cache_position = torch.arange(2, 4)
         position_ids = cache_position.view(1, 1, -1).expand(3, 2, -1)
@@ -631,13 +683,31 @@ def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None, u
             input_names.extend([f"past_key_values.{i}.key", f"past_key_values.{i}.value"])
             output_names.extend([f"present.{i}.key", f"present.{i}.value"])
         input_names.append("inputs_embeds")
-        example_input = {"inputs_embeds": input_embeds, "attention_mask": attention_mask, "position_ids": position_ids, "past_key_values": past_key_values}
+        example_input = {
+            "inputs_embeds": input_embeds,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "past_key_values": past_key_values,
+        }
 
         input_shapes = [
             ov.PartialShape([-1, -1]),
             ov.PartialShape([3, -1, -1]),
         ]
-        input_shapes += [ov.PartialShape([-1, lang_model.model.config.num_key_value_heads, -1, lang_model.model.config.head_dim])] * 2 * num_pkv
+        input_shapes += (
+            [
+                ov.PartialShape(
+                    [
+                        -1,
+                        lang_model.model.config.num_key_value_heads,
+                        -1,
+                        lang_model.model.config.head_dim,
+                    ]
+                )
+            ]
+            * 2
+            * num_pkv
+        )
         input_shapes += [ov.PartialShape([-1, -1, input_embeds.shape[-1]])]
         __make_16bit_traceable(lang_model)
 
@@ -719,10 +789,20 @@ def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None, u
         ov_model = ov.convert_model(
             code2wav_dit,
             example_input={
-                "hidden_states": torch.randn([1, 4, model.token2wav.code2wav_dit_model.config.mel_dim], dtype=torch.float32),
+                "hidden_states": torch.randn(
+                    [1, 4, model.token2wav.code2wav_dit_model.config.mel_dim],
+                    dtype=torch.float32,
+                ),
                 "quantized_code": torch.ones([1, 2], dtype=torch.int64),
-                "speaker_embedding": torch.randn([1, 4, model.token2wav.code2wav_dit_model.config.enc_emb_dim], dtype=torch.float32),
-                "condition_vector": torch.full((1, 400, model.token2wav.code2wav_dit_model.config.mel_dim), fill_value=-11.5129, dtype=torch.float32),
+                "speaker_embedding": torch.randn(
+                    [1, 4, model.token2wav.code2wav_dit_model.config.enc_emb_dim],
+                    dtype=torch.float32,
+                ),
+                "condition_vector": torch.full(
+                    (1, 400, model.token2wav.code2wav_dit_model.config.mel_dim),
+                    fill_value=-11.5129,
+                    dtype=torch.float32,
+                ),
                 "time_step": torch.tensor(0.0051, dtype=torch.float32),
             },
         )

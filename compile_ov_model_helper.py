@@ -275,16 +275,18 @@ def npu_model_import_or_compile(blob_path, model_path, convert_func, device, mod
 
     return model
 
-def npu_llm_model_import_or_compile(blob_path, model_path, weights_bin, device, model_type):
+def npu_llm_model_import_or_compile(blob_path, model_path, weights_bin, device, model_type, max_prompt_len=1024, min_response_len=256):
     """
     Import or compile blob for NPU device, either audio or vision encoder.
 
     Parameters:
     - blob_path: Path to the compiled blob file.
     - model_path: Path to the model file.
-    - convert_func: Function to convert the model to a static shape.
+    - weights_bin: Path to the weights binary file.
     - device: Device to compile the model on.
     - model_type: Type of the model ('audio' or 'vision').
+    - max_prompt_len: Maximum prompt length (default: 2304)
+    - min_response_len: Minimum response length (default: 256)
     """
     config = {}
 
@@ -302,7 +304,7 @@ def npu_llm_model_import_or_compile(blob_path, model_path, weights_bin, device, 
     else:
         print(f"Start to compile {model_type}, device: {device}")
         model = core.read_model(model_path)
-        kv_desc = KVDesc(max_prompt_len=1024, min_response_len=128)
+        kv_desc = KVDesc(max_prompt_len=max_prompt_len, min_response_len=min_response_len)
         kv_pos = KVAxesPosition(batch=0, seq_len=2)
         update_npu_config(config, kv_pos, kv_desc)
         model = core.compile_model(model, device, config)
