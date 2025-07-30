@@ -459,6 +459,7 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         feature_attention_mask=None,
         use_audio_in_video=False,
         video_second_per_grid=None,
+        preprocessed_video_embeds=None,
         **kwargs,
     ):
         if past_key_values != ((),):
@@ -479,6 +480,7 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
             feature_attention_mask=feature_attention_mask,
             use_audio_in_video=use_audio_in_video,
             video_second_per_grid=video_second_per_grid,
+            preprocessed_video_embeds=preprocessed_video_embeds,
             **kwargs,
         )
         model_inputs["position_ids"] = None
@@ -490,7 +492,14 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         return model_inputs
 
     def _process_multimodal_inputs(self, inputs_embeds, input_ids, input_features, feature_attention_mask, 
-                                 pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw):
+                                 pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw, 
+                                 preprocessed_video_embeds=None):
+        """Process multimodal inputs and merge them into embeddings
+        
+        Args:
+            preprocessed_video_embeds: Optional pre-processed video embeddings from external pipeline.
+                                     If provided, will skip the video processing with process_visual_features.
+        """
         """Process multimodal inputs and merge them into embeddings"""
         # Process audio features
         if input_features is not None:
@@ -526,23 +535,32 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         # Process video features
-        if pixel_values_videos is not None:
-            num_images = video_grid_thw[0][0].item()
-            video_grid_thw[0][0] = 1
-            h = video_grid_thw[0][1].item()
-            w = video_grid_thw[0][2].item()
-            image_size = h * w
-            results = []
-            for i in range(num_images):
-                start = i * image_size
-                end = start + image_size
-                pixel_values_video = pixel_values_videos[start:end]
-                video_embed = self.vision_processor.process_visual_features(
-                    pixel_values_video, grid_thw=video_grid_thw
-                )
-                results.append(video_embed)
+        if pixel_values_videos is not None or preprocessed_video_embeds is not None:
+            if preprocessed_video_embeds is not None:
+                # Use pre-processed video embeddings from external pipeline
+                print("[Thinker][Video] Using pre-processed video embeddings from external pipeline")
+                video_embeds = preprocessed_video_embeds
+            else:
+                # Use original video processing pipeline
+                print("[Thinker][Video] Processing video using internal pipeline")
+                num_images = video_grid_thw[0][0].item()
+                video_grid_thw[0][0] = 1
+                h = video_grid_thw[0][1].item()
+                w = video_grid_thw[0][2].item()
+                image_size = h * w
+                results = []
+                for i in range(num_images):
+                    start = i * image_size
+                    end = start + image_size
+                    pixel_values_video = pixel_values_videos[start:end]
+                    video_embed = self.vision_processor.process_visual_features(
+                        pixel_values_video, grid_thw=video_grid_thw
+                    )
+                    results.append(video_embed)
 
-            video_embeds = torch.cat(results, dim=0)
+                video_embeds = torch.cat(results, dim=0)
+            
+            # Apply video embeddings to inputs_embeds
             video_mask = (input_ids == self.config.video_token_index).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
@@ -572,6 +590,7 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         use_audio_in_video: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         video_second_per_grid: Optional[torch.LongTensor] = None,
+        preprocessed_video_embeds: Optional[torch.FloatTensor] = None,
     ) -> Union[tuple, BaseModelOutputWithPast]:
         # Handle audio feature lengths
         if feature_attention_mask is not None:
@@ -611,7 +630,8 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         if input_ids is not None and input_ids.shape[1] != 1:  # Prefill stage
             inputs_embeds = self._process_multimodal_inputs(
                 inputs_embeds, input_ids, input_features, feature_attention_mask,
-                pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw
+                pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw,
+                preprocessed_video_embeds
             )
 
             if attention_mask is not None:
