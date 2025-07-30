@@ -576,7 +576,6 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         # Handle audio feature lengths
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-            input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
         else:
             audio_feature_lengths = None
             
