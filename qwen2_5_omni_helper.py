@@ -296,8 +296,10 @@ def get_rope_index(
 
 
 class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
-    def __init__(self, model_dir, device, config):
+    def __init__(self, model_dir, device, config, max_prompt_len=1024, min_response_len=256):
         self.infer_device = device
+        self.max_prompt_len = max_prompt_len
+        self.min_response_len = min_response_len
         self.model = core.read_model(model_dir / THINKER_LANGUAGE_NAME)
         self.input_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.inputs)}
         self.output_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.outputs)}
@@ -316,7 +318,7 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
             # LLM
             llm_blob_cache_path = model_dir / ".blob_cache" / "thinker_language_npuw.blob"
             weights_bin = model_dir / "openvino_thinker_language_model.bin"
-            llm = ov_compiler.npu_llm_model_import_or_compile(llm_blob_cache_path, model_dir / THINKER_LANGUAGE_NAME, weights_bin, device, 'thinker_language')
+            llm = ov_compiler.npu_llm_model_import_or_compile(llm_blob_cache_path, model_dir / THINKER_LANGUAGE_NAME, weights_bin, device, 'thinker_language', max_prompt_len=self.max_prompt_len, min_response_len=self.min_response_len)
             self.request = llm.create_infer_request()
         else:
             # Audio Embedding
@@ -813,7 +815,9 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
 
 
 class OVQwen2_5OmniTalkerForConditionalGeneration(GenerationMixin):
-    def __init__(self, model_dir, device, config):
+    def __init__(self, model_dir, device, config, max_prompt_len=1024, min_response_len=256):
+        self.max_prompt_len = max_prompt_len
+        self.min_response_len = min_response_len
         self.model = core.read_model(model_dir / TALKER_LANGUAGE_NAME)
         self.input_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.inputs)}
         self.output_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.outputs)}
@@ -821,7 +825,7 @@ class OVQwen2_5OmniTalkerForConditionalGeneration(GenerationMixin):
         if device == "NPU":
             llm_blob_cache_path = model_dir / ".blob_cache" / "talker_language_npuw.blob"
             weights_bin = model_dir / "openvino_talker_language_model.bin"
-            llm = ov_compiler.npu_llm_model_import_or_compile(llm_blob_cache_path, model_dir / TALKER_LANGUAGE_NAME, weights_bin, device, 'talker_language')
+            llm = ov_compiler.npu_llm_model_import_or_compile(llm_blob_cache_path, model_dir / TALKER_LANGUAGE_NAME, weights_bin, device, 'talker_language', max_prompt_len=self.max_prompt_len, min_response_len=self.min_response_len)
             self.request = llm.create_infer_request()
         else:
             llm_blob_cache_path = model_dir / ".blob_cache" / f"talker_language_{device}.blob"
@@ -1104,15 +1108,17 @@ class RungeKutta4ODESolver:
 
 
 class OVQwen2_5OmniModel(GenerationMixin):
-    def __init__(self, model_dir, thinker_device, talker_device, token2wav_device, enable_talker):
+    def __init__(self, model_dir, thinker_device, talker_device, token2wav_device, enable_talker, max_prompt_len=1024, min_response_len=256):
         self.config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
         self.thinker_infer_device = thinker_device
         self.talker_infer_device = talker_device
         self.token2wav_infer_device = token2wav_device
+        self.max_prompt_len = max_prompt_len
+        self.min_response_len = min_response_len
 
         self.has_talker = enable_talker
         model_path = Path(model_dir)
-        self.thinker = OVQwen2_5OmniThinkerForConditionalGeneration(model_path / "thinker", thinker_device, self.config)
+        self.thinker = OVQwen2_5OmniThinkerForConditionalGeneration(model_path / "thinker", thinker_device, self.config, max_prompt_len, min_response_len)
         self.speaker_map = {}
         if self.has_talker:
             self.enable_talker(model_path, talker_device, token2wav_device)
@@ -1123,7 +1129,7 @@ class OVQwen2_5OmniModel(GenerationMixin):
     def enable_talker(self, model_path, talker_device, token2wav_device=None):
         if token2wav_device is None:
             token2wav_device = talker_device
-        self.talker = OVQwen2_5OmniTalkerForConditionalGeneration(model_path / "talker", talker_device, self.config)
+        self.talker = OVQwen2_5OmniTalkerForConditionalGeneration(model_path / "talker", talker_device, self.config, self.max_prompt_len, self.min_response_len)
 
         if token2wav_device == 'NPU':
             token2wav_dit_blob_cache_path = model_path / ".blob_cache" / "token2wav_dit.blob"
@@ -1336,7 +1342,7 @@ class OVQwen2_5OmniModel(GenerationMixin):
         talker_generate_codes = talker_result[:, talker_input_ids.shape[1] : -1]
 
         # Handle NPU device constraints - limit to 128 length and pad if necessary
-        if self.token2wav_infer_device == 'NPU':
+        if self.token2wav_infer_device == 'NPU' or self.token2wav_infer_device == 'GPU':
             current_length = talker_generate_codes.shape[1]
             if current_length > 128:
                 # Slice to 128 if longer
