@@ -1079,20 +1079,56 @@ class Token2WavProcessor:
         
     def process_codes_to_audio(self, talker_generate_codes: torch.Tensor, speaker_params: Dict) -> torch.Tensor:
         """Convert talker generated codes to audio waveform"""
-        # Handle device constraints
-        if self.device == 'NPU' or self.device == 'GPU':
-            current_length = talker_generate_codes.shape[1]
-            if current_length > 128:
-                talker_generate_codes = talker_generate_codes[:, :128]
-                print(f"[{self.device}] Sliced talker_generate_codes from {current_length} to 128")
-            elif current_length < 128:
-                padding_length = 128 - current_length
-                padding = torch.zeros((talker_generate_codes.shape[0], padding_length), 
-                                    dtype=talker_generate_codes.dtype, 
-                                    device=talker_generate_codes.device)
-                talker_generate_codes = torch.cat([talker_generate_codes, padding], dim=1)
-                print(f"[{self.device}] Padded talker_generate_codes from {current_length} to 128")
+        original_length = talker_generate_codes.shape[1]
+        chunk_size = 128
+        
+        print(f"[Token2wav][{self.device}] Processing {original_length} tokens in chunks of {chunk_size}")
+        
+        # Split codes into chunks of 128 tokens
+        waveform_chunks = []
+        num_chunks = (original_length + chunk_size - 1) // chunk_size  # Ceiling division
+        
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * chunk_size
+            end_idx = min(start_idx + chunk_size, original_length)
+            
+            # Extract current chunk
+            current_chunk = talker_generate_codes[:, start_idx:end_idx]
+            current_chunk_length = current_chunk.shape[1]
+            
+            # Only NPU needs padding for incomplete chunks
+            needs_padding = current_chunk_length < chunk_size and self.device == "NPU"
+            
+            if needs_padding:
+                padding_length = chunk_size - current_chunk_length
+                padding = torch.zeros((current_chunk.shape[0], padding_length), 
+                                    dtype=current_chunk.dtype, 
+                                    device=current_chunk.device)
+                current_chunk = torch.cat([current_chunk, padding], dim=1)
 
+            # Process current chunk
+            chunk_waveform = self._process_single_chunk(current_chunk, speaker_params, chunk_idx + 1, num_chunks, current_chunk_length if needs_padding else None)
+            waveform_chunks.append(chunk_waveform)
+        
+        # Concatenate all waveform chunks
+        if len(waveform_chunks) == 1:
+            final_waveform = waveform_chunks[0]
+        else:
+            final_waveform = torch.cat(waveform_chunks, dim=-1)  # Concatenate along time dimension
+        
+        print(f"[Token2wav][{self.device}] Final waveform shape: {final_waveform.shape}")
+        return final_waveform.squeeze().cpu().float()
+
+    def _process_single_chunk(self, talker_generate_codes: torch.Tensor, speaker_params: Dict, chunk_idx: int, total_chunks: int, original_length: int = None) -> torch.Tensor:
+        """Process a single chunk of tokens to generate audio waveform
+        
+        Args:
+            talker_generate_codes: Input codes tensor (may be padded for NPU)
+            speaker_params: Speaker parameters
+            chunk_idx: Current chunk index (1-based)
+            total_chunks: Total number of chunks
+            original_length: Original length before padding (for NPU only)
+        """
         # Prepare parameters
         reference_mel_spectrogram = speaker_params["ref_mel"].to(torch.device("cpu")).float()
         conditioning_vector = speaker_params["cond"].to(torch.device("cpu")).float()
@@ -1114,7 +1150,7 @@ class Token2WavProcessor:
             model_output = torch.from_numpy(
                 self.token2wav_dit([hidden_states, reference_mel_spectrogram, conditioning_vector, talker_generate_codes, time_step])[0]
             )
-            print(f"[Token2wav][Model_ID_0][{self.device}] token2wav_dit infer time: {(time.perf_counter() - token2wav_dit_start_time)*1000} ms")
+            print(f"[Token2wav][Model_ID_0][{self.device}] Chunk {chunk_idx}/{total_chunks} token2wav_dit infer time: {(time.perf_counter() - token2wav_dit_start_time)*1000} ms")
             guided_prediction, null_prediction = torch.chunk(model_output, 2, dim=0)
             return guided_prediction + (guided_prediction - null_prediction) * guidance_scale
 
@@ -1125,20 +1161,28 @@ class Token2WavProcessor:
         if sway_coefficient is not None:
             time_embedding += sway_coefficient * (torch.cos(torch.pi / 2 * time_embedding) - 1 + time_embedding)
 
-        print(f"[Token2wav][Model_ID_0][hidden_states] Shape {initial_state.shape}")
+        print(f"[Token2wav][Model_ID_0] Chunk {chunk_idx}/{total_chunks} hidden_states Shape {initial_state.shape}")
         ode_solver = RungeKutta4ODESolver(function=ode_function, initial_value=initial_state)
         solution_trajectory = ode_solver.integrate(time_embedding)
 
         # Generate final waveform
         generated_waveform = solution_trajectory[-1]
         generated_mel_spectrogram = generated_waveform.permute(0, 2, 1)
-        print(f"[Token2wav][Model_ID_1][mel_spectrogram] Shape {generated_mel_spectrogram.shape}")
+        print(f"[Token2wav][Model_ID_1] Chunk {chunk_idx}/{total_chunks} mel_spectrogram Shape {generated_mel_spectrogram.shape}")
         
         token2wav_bigvgan_start_time = time.perf_counter()
         waveform = torch.from_numpy(self.token2wav_bigvgan([generated_mel_spectrogram])[0])
-        print(f"[Token2wav][Model_ID_1][{self.device}] token2wav_bigvgan infer time: {(time.perf_counter() - token2wav_bigvgan_start_time)*1000} ms")
+        print(f"[Token2wav][Model_ID_1][{self.device}] Chunk {chunk_idx}/{total_chunks} token2wav_bigvgan infer time: {(time.perf_counter() - token2wav_bigvgan_start_time)*1000} ms")
         
-        return waveform.squeeze().cpu().float()
+        # For NPU, trim the output to match original length if padding was used
+        if original_length is not None and self.device == "NPU":
+            # Calculate how much to trim based on the ratio of original to padded length
+            actual_length = talker_generate_codes.shape[1]
+            trim_ratio = original_length / actual_length
+            target_samples = int(waveform.shape[-1] * trim_ratio)
+            waveform = waveform[..., :target_samples]
+        
+        return waveform
 
 
 # ============================================================================
@@ -1147,20 +1191,41 @@ class Token2WavProcessor:
 
 
 class OVQwen2_5OmniModel(GenerationMixin):
-    def __init__(self, model_dir, thinker_device, talker_device, token2wav_device, enable_talker, max_prompt_len=1024, min_response_len=256):
+    def __init__(self, model_dir, thinker_device, talker_device, token2wav_device, enable_talker, 
+                 thinker_max_prompt_len=1024, thinker_min_response_len=256,
+                 talker_max_prompt_len=1024, talker_min_response_len=256):
+        """Initialize OVQwen2_5OmniModel with separate parameters for each LLM
+        
+        Args:
+            model_dir: Path to model directory
+            thinker_device: Device for thinker LLM (CPU/GPU/NPU)
+            talker_device: Device for talker LLM (CPU/GPU/NPU)
+            token2wav_device: Device for token2wav models (CPU/GPU/NPU)
+            enable_talker: Whether to enable talker functionality
+            thinker_max_prompt_len: Maximum prompt length for thinker LLM (default: 1024)
+            thinker_min_response_len: Minimum response length for thinker LLM (default: 256)
+            talker_max_prompt_len: Maximum prompt length for talker LLM (default: 1024)
+            talker_min_response_len: Minimum response length for talker LLM (default: 256)
+        """
         self.config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
         self.thinker_infer_device = thinker_device
         self.talker_infer_device = talker_device
         self.token2wav_infer_device = token2wav_device
-        self.max_prompt_len = max_prompt_len
-        self.min_response_len = min_response_len
+        
+        # Store parameters for each LLM separately
+        self.thinker_max_prompt_len = thinker_max_prompt_len
+        self.thinker_min_response_len = thinker_min_response_len
+        self.talker_max_prompt_len = talker_max_prompt_len
+        self.talker_min_response_len = talker_min_response_len
+        
         self.has_talker = enable_talker
         
         model_path = Path(model_dir)
         
         # Initialize Thinker
         self.thinker = OVQwen2_5OmniThinkerForConditionalGeneration(
-            model_path / "thinker", thinker_device, self.config, max_prompt_len, min_response_len
+            model_path / "thinker", thinker_device, self.config, 
+            self.thinker_max_prompt_len, self.thinker_min_response_len
         )
         
         # Initialize Talker and Token2Wav if enabled
@@ -1177,9 +1242,10 @@ class OVQwen2_5OmniModel(GenerationMixin):
         if token2wav_device is None:
             token2wav_device = talker_device
             
-        # Initialize Talker
+        # Initialize Talker with its own parameters
         self.talker = OVQwen2_5OmniTalkerForConditionalGeneration(
-            model_path / "talker", talker_device, self.config, self.max_prompt_len, self.min_response_len
+            model_path / "talker", talker_device, self.config, 
+            self.talker_max_prompt_len, self.talker_min_response_len
         )
 
         # Initialize Token2Wav models

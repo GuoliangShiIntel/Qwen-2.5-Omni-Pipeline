@@ -265,6 +265,8 @@ def npu_model_import_or_compile(blob_path, model_path, convert_func, device, mod
         update_config(config, ("NPU_TILES", "6"))
         model = core.compile_model(model, device, config)
         try:
+            # Ensure the parent directory exists
+            blob_path.parent.mkdir(parents=True, exist_ok=True)
             user_stream = io.BytesIO()
             model.export_model(user_stream)
             with blob_path.open("wb") as fout:
@@ -309,6 +311,8 @@ def npu_llm_model_import_or_compile(blob_path, model_path, weights_bin, device, 
         update_npu_config(config, kv_pos, kv_desc)
         model = core.compile_model(model, device, config)
         try:
+            # Ensure the parent directory exists
+            blob_path.parent.mkdir(parents=True, exist_ok=True)
             user_stream = io.BytesIO()
             model.export_model(user_stream)
             with blob_path.open("wb") as fout:
@@ -344,6 +348,8 @@ def cpu_gpu_model_import_or_compile(blob_path, model_path, device, model_type, b
         model = core.compile_model(model, device)
         if blob_cache:
             try:
+                # Ensure the parent directory exists
+                blob_path.parent.mkdir(parents=True, exist_ok=True)
                 user_stream = io.BytesIO()
                 model.export_model(user_stream)
                 with blob_path.open("wb") as fout:
