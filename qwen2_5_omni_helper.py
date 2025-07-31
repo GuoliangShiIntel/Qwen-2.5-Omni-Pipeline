@@ -341,7 +341,7 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
     def _initialize_llm_model(self, model_dir, device):
         """Initialize the LLM model based on device type"""
         if device == "NPU":
-            llm_blob_cache_path = model_dir / ".blob_cache" / "thinker_language_npuw.blob"
+            llm_blob_cache_path = model_dir / ".blob_cache" / f"thinker_language_{device}_prompt{self.max_prompt_len}_response{self.min_response_len}.blob"
             weights_bin = model_dir / "openvino_thinker_language_model.bin"
             llm = ov_compiler.npu_llm_model_import_or_compile(
                 llm_blob_cache_path, model_dir / THINKER_LANGUAGE_NAME, 
@@ -361,25 +361,25 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         # Audio models
         if device == "NPU":
             audio_embed = ov_compiler.npu_model_import_or_compile(
-                model_dir / ".blob_cache" / "thinker_audio_embedding.blob",
+                model_dir / ".blob_cache" / f"thinker_audio_embedding_{device}.blob",
                 model_dir / THINKER_AUDIO_EMBED_NAME,
                 ov_compiler.convert_thinker_audio_embedding_to_static_shape,
                 device, 'thinker_audio_embedding'
             )
             audio = ov_compiler.npu_model_import_or_compile(
-                model_dir / ".blob_cache" / "thinker_audio.blob",
+                model_dir / ".blob_cache" / f"thinker_audio_{device}.blob",
                 model_dir / THINKER_AUDIO_NAME,
                 ov_compiler.convert_thinker_audio_to_static_shape,
                 device, 'thinker_audio'
             )
             audio_state = ov_compiler.npu_model_import_or_compile(
-                model_dir / ".blob_cache" / "thinker_audio_state.blob",
+                model_dir / ".blob_cache" / f"thinker_audio_state_{device}.blob",
                 model_dir / THINKER_AUDIO_STATE_NAME,
                 ov_compiler.convert_thinker_audio_state_to_static_shape,
                 device, 'thinker_audio_state'
             )
             visual_merger = ov_compiler.npu_model_import_or_compile(
-                model_dir / ".blob_cache" / "thinker_vision_merger.blob",
+                model_dir / ".blob_cache" / f"thinker_vision_merger_{device}.blob",
                 model_dir / THINKER_MERGER_NAME,
                 ov_compiler.convert_thinker_vision_merger_to_static_shape,
                 device, 'thinker_vision_merger'
@@ -824,7 +824,7 @@ class OVQwen2_5OmniTalkerForConditionalGeneration(GenerationMixin):
     def _initialize_llm_model(self, model_dir, device):
         """Initialize the LLM model based on device type"""
         if device == "NPU":
-            llm_blob_cache_path = model_dir / ".blob_cache" / "talker_language_npuw.blob"
+            llm_blob_cache_path = model_dir / ".blob_cache" / f"talker_language_{device}_prompt{self.max_prompt_len}_response{self.min_response_len}.blob"
             weights_bin = model_dir / "openvino_talker_language_model.bin"
             llm = ov_compiler.npu_llm_model_import_or_compile(
                 llm_blob_cache_path, model_dir / TALKER_LANGUAGE_NAME, 
@@ -1185,13 +1185,13 @@ class OVQwen2_5OmniModel(GenerationMixin):
         # Initialize Token2Wav models
         if token2wav_device == 'NPU':
             token2wav_dit = ov_compiler.npu_model_import_or_compile(
-                model_path / ".blob_cache" / "token2wav_dit.blob",
+                model_path / ".blob_cache" / f"token2wav_dit_{token2wav_device}.blob",
                 model_path / TOKEN2WAV_DIT_NAME,
                 ov_compiler.convert_token2wav_dit_to_static_shape,
                 token2wav_device, 'token2wav_dit'
             )
             token2wav_bigvgan = ov_compiler.npu_model_import_or_compile(
-                model_path / ".blob_cache" / "token2wav_bigvgan.blob",
+                model_path / ".blob_cache" / f"token2wav_bigvgan_{token2wav_device}.blob",
                 model_path / TOKEN2WAV_BIGVGAN_NAME,
                 ov_compiler.convert_token2wav_bigvgan_to_static_shape,
                 token2wav_device, 'token2wav_bigvgan'
