@@ -32,10 +32,14 @@ use_audio_in_video = False
 frame_selection_enabled = True  # Set to True to select only 2nd and 4th frames
 selected_frame_indices = [1, 3]  # 0-based indices: [1, 3] means 2nd and 4th frames
 
-model_id = "Qwen/Qwen2.5-Omni-7B-NF4"
+model_id = "Qwen/Qwen2.5-Omni-3B-NF4"
 model_dir = Path(model_id.split("/")[-1])
 
-ov_model = OVQwen2_5OmniModel(model_dir, thinker_device=thinker_device, talker_device=talker_device, token2wav_device=token2wav_device, enable_talker=enable_talker, max_prompt_len=4096, min_response_len=512)
+ov_model = OVQwen2_5OmniModel(model_dir, thinker_device=thinker_device, talker_device=talker_device, token2wav_device=token2wav_device, 
+                              enable_talker=enable_talker, thinker_max_prompt_len=2048, thinker_min_response_len=256,
+                              talker_max_prompt_len=1024, talker_min_response_len=256,
+                              enable_cdpruner=True, cdpruner_num_visual_tokens=256, cdpruner_relevance_weight=0.5)
+
 processor = Qwen2_5OmniProcessor.from_pretrained(model_dir)
 
 def get_pytorch_device(ov_device):
@@ -385,6 +389,11 @@ def process_conversation(conversation, preprocessed_video_embeds=None):
         text_ids = ov_model.generate(**inputs, **generate_kwargs)
     else:
         text_ids, audio = ov_model.generate(**inputs, **generate_kwargs)
+        
+        # Ensure the outputs directory exists
+        output_dir = Path("outputs")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
         sf.write("outputs/output.wav", audio.reshape(-1).detach().cpu().numpy(), samplerate=24000)
 
     conversation[1]["content"] = [item for item in conversation[1]["content"] if item["type"] == "text"]
@@ -406,8 +415,17 @@ conversation = [
         #     "2. 如果我在看一些文章或者浏览网页，请对里面的内容进行翻译/归纳/总结，不要太简略，又能让我更快获取重要信息。"
         #     "3. 如果我在购物，请给出我想购买产品的对比信息和一些重要参数，并给出你的推荐。"},
         # ],
+        # "content": [
+        #     {"type": "text", "text": "请详细描述这段视频的内容。这段视频展示了一个论文的基本介绍页面，包括以下部分："
+        #                             "1. 摘要 ：请详细描述论文的摘要内容，包括研究的背景、目的、方法和主要发现。"
+        #                             "2. 框架 ：请详细描述论文的框架图，包括各个模块的功能和相互关系。"
+        #                             "3. 效果图 ：请详细描述论文中的效果图，包括图中的数据、图表类型和所展示的结果。"
+        #                             "4. 性能比较 ：请详细描述论文中的性能比较部分，包括比较的指标、方法和结果。"
+        #                             "请确保描述中包含所有细节，并且每个部分都清晰明了。"},
+        # ],
         "content": [
-            {"type": "text", "text": "请你非常详细的描述你看到的所有内容，不要遗漏任何细节。"},
+            {"type": "text", "text": "请详细描述你看到的所有内容，包括且不限于："
+             "1. 打印出所有的文字；2.详细解释图片中的架构和细节；3.详细解释图标中的数据，并给出具体值；4.做一个综述总结；每一条为一个段落"},
         ],
     },
 ]

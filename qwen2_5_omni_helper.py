@@ -464,6 +464,22 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
     ):
         if past_key_values != ((),):
             past_key_values = None
+            
+        # Check if this is the first generation (prefill stage)
+        is_prefill = cache_position is None or cache_position[0] == 0
+        
+        # If not in prefill stage and CDPruner is enabled, need special handling for attention_mask
+        if not is_prefill and hasattr(self, 'enable_cdpruner') and self.enable_cdpruner and hasattr(self, '_cdpruner_tokens_removed'):
+            # Get the number of tokens reduced by CDPruner
+            tokens_removed = self._cdpruner_tokens_removed
+            
+            # If attention_mask needs length adjustment
+            if attention_mask is not None:
+                expected_length = attention_mask.shape[1] - tokens_removed
+                
+                # Simply slice the attention_mask to the expected length (assuming all values are 1)
+                attention_mask = attention_mask[:, :expected_length]
+                
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
@@ -491,81 +507,189 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
 
         return model_inputs
 
+    def _process_audio_inputs(self, inputs_embeds, input_ids, input_features, feature_attention_mask):
+        """Process audio features and integrate them into input embeddings"""
+        if input_features is None:
+            return inputs_embeds
+            
+        audio_features, audio_output_lengths = self.audio_processor.process_audio_features(
+            input_features, feature_attention_mask
+        )
+        audio_mask = (input_ids == self.config.audio_token_index).unsqueeze(-1).expand_as(inputs_embeds)
+        audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
+        return inputs_embeds.masked_scatter(audio_mask, audio_features)
+    
+    def _process_image_inputs(self, inputs_embeds, input_ids, pixel_values, image_grid_thw):
+        """Process image features and integrate them into input embeddings"""
+        if pixel_values is None:
+            return inputs_embeds
+            
+        num_images = image_grid_thw.shape[0]
+        results = []
+        current_index = 0
+        
+        for i in range(num_images):
+            h, w = image_grid_thw[i][1].item(), image_grid_thw[i][2].item()
+            image_size = h * w
+            image_pixels = pixel_values[current_index:current_index + image_size]
+            
+            image_embed = self.vision_processor.process_visual_features(
+                image_pixels, grid_thw=image_grid_thw[i:i+1, :]
+            )
+            results.append(image_embed)
+            current_index += image_size
+        
+        image_embeds = torch.cat(results, dim=0)
+        image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        return inputs_embeds.masked_scatter(image_mask, image_embeds)
+    
+    def _prepare_video_frames(self, pixel_values_videos, video_grid_thw, preprocessed_video_embeds):
+        """Prepare video frame embeddings from either raw pixels or preprocessed embeddings"""
+        if preprocessed_video_embeds is not None:
+            # Use pre-processed video embeddings
+            num_frames = video_grid_thw[0][0].item()
+            h, w = video_grid_thw[0][1].item(), video_grid_thw[0][2].item()
+            tokens_per_frame = (h // self.spatial_merge_size) * (w // self.spatial_merge_size)
+            
+            video_frame_results = preprocessed_video_embeds.view(num_frames, tokens_per_frame, -1).unbind(0)
+            return [frame.contiguous() for frame in video_frame_results]
+        else:
+            # Process raw video pixels
+            num_frames = video_grid_thw[0][0].item()
+            video_grid_thw[0][0] = 1  # Temporarily set to 1 for processing
+            h, w = video_grid_thw[0][1].item(), video_grid_thw[0][2].item()
+            image_size = h * w
+            
+            results = []
+            for i in range(num_frames):
+                start, end = i * image_size, (i + 1) * image_size
+                pixel_values_video = pixel_values_videos[start:end]
+                video_embed = self.vision_processor.process_visual_features(
+                    pixel_values_video, grid_thw=video_grid_thw
+                )
+                results.append(video_embed)
+            
+            return results
+    
+    def _apply_cdpruner_if_enabled(self, video_frame_results, inputs_embeds, input_ids):
+        """Apply CDPruner to video frames if enabled"""
+        if not (hasattr(self, 'enable_cdpruner') and self.enable_cdpruner and hasattr(self, 'cdpruner')):
+            return None, None, None
+            
+        text_embeddings = self._extract_text_embeddings(inputs_embeds, input_ids)
+        pruned_features, selected_tokens, pruning_mask = self._apply_video_pruning(video_frame_results, text_embeddings)
+        
+        return pruned_features, selected_tokens, pruning_mask
+    
+    def _integrate_video_embeddings(self, inputs_embeds, input_ids, video_frame_results, pruned_features, pruning_mask):
+        """Integrate video embeddings into input embeddings with or without pruning"""
+        if pruned_features is not None:
+            # CDPruner is enabled - use pruned features
+            num_frames = len(video_frame_results)
+            original_tokens_per_frame = video_frame_results[0].shape[0]
+            pruned_tokens_per_frame = pruning_mask[0].sum().item()
+            
+            inputs_embeds, removal_mask = self._reconstruct_inputs_embeds_with_pruned_video(
+                inputs_embeds, input_ids, pruned_features, None, pruning_mask,
+                original_tokens_per_frame, pruned_tokens_per_frame
+            )
+            return inputs_embeds, removal_mask
+        else:
+            # No pruning - standard integration
+            video_embeds = torch.cat(video_frame_results, dim=0)
+            video_mask = (input_ids == self.config.video_token_index).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            return inputs_embeds.masked_scatter(video_mask, video_embeds), None
+    
+    def _adjust_masks_and_positions(self, inputs_embeds, attention_mask, position_ids, original_seq_len, removal_mask):
+        """Adjust attention mask and position IDs if sequence length changed"""
+        if inputs_embeds.shape[1] == original_seq_len:
+            return attention_mask.to(inputs_embeds.device) if attention_mask is not None else None, position_ids
+        
+        # Sequence length changed - record the change and adjust masks
+        tokens_removed = original_seq_len - inputs_embeds.shape[1]
+        self._cdpruner_tokens_removed = tokens_removed
+        self._cdpruner_adjusted_length = inputs_embeds.shape[1]
+        print(f"[DEBUG] CDPruner adjusted sequence length from {original_seq_len} to {inputs_embeds.shape[1]}, removed {tokens_removed} tokens")
+        
+        # Adjust attention_mask
+        if attention_mask is not None:
+            if removal_mask is not None:
+                keep_mask = ~removal_mask[0]
+                attention_mask = attention_mask[:, keep_mask].to(inputs_embeds.device)
+                print(f"[DEBUG] Adjusted attention_mask shape: {attention_mask.shape}")
+            else:
+                # Fallback: create new attention mask
+                attention_mask = torch.ones(
+                    attention_mask.shape[0], inputs_embeds.shape[1], 
+                    dtype=attention_mask.dtype, device=inputs_embeds.device
+                )
+        
+        # Adjust position_ids
+        if position_ids is not None:
+            if removal_mask is not None:
+                keep_mask = ~removal_mask[0]
+                position_ids = position_ids[:, :, keep_mask]
+            else:
+                # Fallback: reconstruct position_ids
+                dims, batch_size, _ = position_ids.shape
+                new_position_ids = torch.zeros(
+                    dims, batch_size, inputs_embeds.shape[1], 
+                    dtype=position_ids.dtype, device=position_ids.device
+                )
+                for dim in range(dims):
+                    for batch_idx in range(batch_size):
+                        new_position_ids[dim, batch_idx, :] = torch.arange(inputs_embeds.shape[1])
+                position_ids = new_position_ids
+        
+        return attention_mask, position_ids
+
     def _process_multimodal_inputs(self, inputs_embeds, input_ids, input_features, feature_attention_mask, 
                                  pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw, 
+                                 attention_mask, position_ids, original_seq_len,
                                  preprocessed_video_embeds=None):
         """Process multimodal inputs and merge them into embeddings
         
         Args:
+            inputs_embeds: Input embeddings tensor
+            input_ids: Input token IDs
+            input_features: Audio feature inputs
+            feature_attention_mask: Audio feature attention mask
+            pixel_values: Image pixel values
+            image_grid_thw: Image grid dimensions (time, height, width)
+            pixel_values_videos: Video pixel values
+            video_grid_thw: Video grid dimensions (time, height, width)
+            attention_mask: Attention mask for the sequence
+            position_ids: Position IDs for the sequence
+            original_seq_len: Original sequence length before processing
             preprocessed_video_embeds: Optional pre-processed video embeddings from external pipeline.
                                      If provided, will skip the video processing with process_visual_features.
+                                     
+        Returns:
+            Tuple containing:
+                - inputs_embeds: Processed input embeddings
+                - attention_mask: Adjusted attention mask (if sequence length changed)
+                - position_ids: Adjusted position IDs (if sequence length changed)
         """
-        """Process multimodal inputs and merge them into embeddings"""
-        # Process audio features
-        if input_features is not None:
-            audio_features, audio_output_lengths = self.audio_processor.process_audio_features(
-                input_features, feature_attention_mask
-            )
-            audio_mask = (input_ids == self.config.audio_token_index).unsqueeze(-1).expand_as(inputs_embeds)
-            audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
-
-        # Process image features  
-        if pixel_values is not None:
-            num_images = image_grid_thw.shape[0]
-            current_index = 0
-            results = []
-            for i in range(num_images):
-                h = image_grid_thw[i][1].item()
-                w = image_grid_thw[i][2].item()
-                image_size = h * w
-                start = current_index
-                end = start + image_size
-                image_pixels = pixel_values[start:end]
-
-                image_embed = self.vision_processor.process_visual_features(
-                    image_pixels, grid_thw=image_grid_thw[i:i+1, :]
-                )
-                results.append(image_embed)
-                current_index = end
-
-            image_embeds = torch.cat(results, dim=0)
-            image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
-
-        # Process video features
+        removal_mask = None
+        
+        # Process each modality sequentially
+        inputs_embeds = self._process_audio_inputs(inputs_embeds, input_ids, input_features, feature_attention_mask)
+        inputs_embeds = self._process_image_inputs(inputs_embeds, input_ids, pixel_values, image_grid_thw)
+        
+        # Process video features if present
         if pixel_values_videos is not None or preprocessed_video_embeds is not None:
-            if preprocessed_video_embeds is not None:
-                # Use pre-processed video embeddings from external pipeline
-                print("[Thinker][Video] Using pre-processed video embeddings from external pipeline")
-                video_embeds = preprocessed_video_embeds
-            else:
-                # Use original video processing pipeline
-                print("[Thinker][Video] Processing video using internal pipeline")
-                num_images = video_grid_thw[0][0].item()
-                video_grid_thw[0][0] = 1
-                h = video_grid_thw[0][1].item()
-                w = video_grid_thw[0][2].item()
-                image_size = h * w
-                results = []
-                for i in range(num_images):
-                    start = i * image_size
-                    end = start + image_size
-                    pixel_values_video = pixel_values_videos[start:end]
-                    video_embed = self.vision_processor.process_visual_features(
-                        pixel_values_video, grid_thw=video_grid_thw
-                    )
-                    results.append(video_embed)
-
-                video_embeds = torch.cat(results, dim=0)
-            
-            # Apply video embeddings to inputs_embeds
-            video_mask = (input_ids == self.config.video_token_index).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
-            
-        return inputs_embeds
+            video_frame_results = self._prepare_video_frames(pixel_values_videos, video_grid_thw, preprocessed_video_embeds)
+            pruned_features, selected_tokens, pruning_mask = self._apply_cdpruner_if_enabled(video_frame_results, inputs_embeds, input_ids)
+            inputs_embeds, removal_mask = self._integrate_video_embeddings(inputs_embeds, input_ids, video_frame_results, pruned_features, pruning_mask)
+        
+        # Adjust masks and positions if sequence length changed
+        attention_mask, position_ids = self._adjust_masks_and_positions(
+            inputs_embeds, attention_mask, position_ids, original_seq_len, removal_mask
+        )
+        
+        return inputs_embeds, attention_mask, position_ids
 
     def forward(
         self,
@@ -628,9 +752,12 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
             
         # Process multimodal inputs during prefill stage
         if input_ids is not None and input_ids.shape[1] != 1:  # Prefill stage
-            inputs_embeds = self._process_multimodal_inputs(
+            original_seq_len = inputs_embeds.shape[1]
+            
+            inputs_embeds, attention_mask, position_ids = self._process_multimodal_inputs(
                 inputs_embeds, input_ids, input_features, feature_attention_mask,
                 pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw,
+                attention_mask, position_ids, original_seq_len,
                 preprocessed_video_embeds
             )
 
@@ -709,6 +836,221 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         if past_key_values is None:
             return 0
         return self._past_length
+    
+    def _extract_text_embeddings(self, inputs_embeds: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        # Get vision_bos token id (this marks the start of vision content)
+        vision_bos_token = getattr(self.config, 'vision_start_token_id', None)
+        if vision_bos_token is None:
+            vision_bos_token = 151652  # Common value for <|vision_bos|>
+        
+        # Find the position of <|vision_bos|> token
+        vision_bos_positions = (input_ids[0] == vision_bos_token).nonzero(as_tuple=True)[0]
+        
+        if len(vision_bos_positions) == 0:
+            raise ValueError("Can not find vision_bos_positions to extrct test embeddings")
+        
+        # Take everything before the first <|vision_bos|> as text
+        text_end_pos = vision_bos_positions[0].item()
+        text_embeddings = inputs_embeds[0, :text_end_pos, :]  # [text_length, feature_dim]
+        return text_embeddings
+    
+    def _validate_video_reconstruction_inputs(self, inputs_embeds: torch.Tensor, input_ids: torch.Tensor, 
+                                            pruning_mask: torch.Tensor, original_video_tokens_per_frame: int) -> tuple[int, torch.Tensor]:
+        """Validate inputs and extract video token positions"""
+        # Ensure batch size is 1
+        if inputs_embeds.shape[0] != 1:
+            raise ValueError(f"Batch size must be 1, got {inputs_embeds.shape[0]}")
+        if input_ids.shape[0] != 1:
+            raise ValueError(f"Batch size must be 1, got {input_ids.shape[0]}")
+        
+        # Find all video token positions (video token ID is 151656)
+        video_token_id = 151656
+        video_positions = (input_ids[0] == video_token_id).nonzero(as_tuple=True)[0]
+        
+        # Validate expected number of video tokens
+        num_frames = pruning_mask.shape[0]
+        expected_total_tokens = num_frames * original_video_tokens_per_frame
+        
+        if len(video_positions) != expected_total_tokens:
+            raise ValueError(
+                f"Expected {expected_total_tokens} video tokens "
+                f"(num_frames={num_frames} * tokens_per_frame={original_video_tokens_per_frame}), "
+                f"found {len(video_positions)}"
+            )
+        
+        return num_frames, video_positions
+    
+    def _identify_video_frame_segments(self, video_positions: torch.Tensor, num_frames: int, 
+                                     original_video_tokens_per_frame: int) -> list[tuple[int, int]]:
+        """Group video positions into frame segments"""
+        frame_segments = []
+        
+        for frame_idx in range(num_frames):
+            start_idx = frame_idx * original_video_tokens_per_frame
+            end_idx = start_idx + original_video_tokens_per_frame
+            
+            if end_idx > len(video_positions):
+                raise ValueError(f"Not enough video tokens remaining for frame {frame_idx}")
+            
+            frame_start_pos = video_positions[start_idx].item()
+            frame_end_pos = frame_start_pos + original_video_tokens_per_frame
+            
+            # Verify that this frame's tokens are consecutive
+            frame_positions = video_positions[start_idx:end_idx].tolist()
+            expected_positions = list(range(frame_start_pos, frame_end_pos))
+            
+            if frame_positions != expected_positions:
+                raise ValueError(
+                    f"Frame {frame_idx} tokens are not consecutive. "
+                    f"Expected: {expected_positions}, Got: {frame_positions}"
+                )
+            
+            frame_segments.append((frame_start_pos, frame_end_pos))
+        
+        return frame_segments
+    
+    def _create_removal_mask(self, inputs_embeds: torch.Tensor, frame_segments: list[tuple[int, int]], 
+                           pruning_mask: torch.Tensor) -> torch.Tensor:
+        """Create removal mask based on pruning decisions"""
+        original_seq_len = inputs_embeds.shape[1]
+        removal_mask = torch.zeros(1, original_seq_len, dtype=torch.bool, device=inputs_embeds.device)
+        
+        for frame_idx, (frame_start, frame_end) in enumerate(frame_segments):
+            frame_pruning_mask = pruning_mask[frame_idx]  # [tokens_per_frame]
+            tokens_to_remove = ~frame_pruning_mask  # Invert mask to get removed tokens
+            
+            frame_positions_in_seq = torch.arange(frame_start, frame_end, device=removal_mask.device)
+            removal_mask[0, frame_positions_in_seq] = tokens_to_remove
+        
+        return removal_mask
+    
+    def _reconstruct_embeddings_with_pruned_frames(self, inputs_embeds: torch.Tensor, frame_segments: list[tuple[int, int]], 
+                                                 pruned_video_embeds: torch.Tensor, pruned_video_tokens_per_frame: int) -> torch.Tensor:
+        """Reconstruct input embeddings by replacing video frames with pruned versions"""
+        new_embeds_parts = []
+        current_pos = 0
+        
+        # Flatten pruned embeddings for efficient indexing
+        flattened_pruned_embeds = pruned_video_embeds.view(-1, pruned_video_embeds.shape[-1])
+        pruned_embed_idx = 0
+        
+        for frame_start, frame_end in frame_segments:
+            # Add content before this frame
+            if current_pos < frame_start:
+                new_embeds_parts.append(inputs_embeds[0, current_pos:frame_start, :])
+            
+            # Add pruned embeddings for this frame
+            frame_pruned_embeds = flattened_pruned_embeds[
+                pruned_embed_idx:pruned_embed_idx + pruned_video_tokens_per_frame
+            ]
+            new_embeds_parts.append(frame_pruned_embeds)
+            pruned_embed_idx += pruned_video_tokens_per_frame
+            
+            current_pos = frame_end
+        
+        # Add remaining content after the last frame
+        original_seq_len = inputs_embeds.shape[1]
+        if current_pos < original_seq_len:
+            new_embeds_parts.append(inputs_embeds[0, current_pos:, :])
+        
+        # Concatenate all parts
+        if new_embeds_parts:
+            new_inputs_embeds = torch.cat(new_embeds_parts, dim=0).unsqueeze(0)
+        else:
+            # Edge case: no content
+            new_inputs_embeds = torch.empty(
+                1, 0, inputs_embeds.shape[-1], 
+                device=inputs_embeds.device, dtype=inputs_embeds.dtype
+            )
+        
+        return new_inputs_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+
+    def _reconstruct_inputs_embeds_with_pruned_video(self, inputs_embeds: torch.Tensor, input_ids: torch.Tensor, 
+                                                   pruned_video_embeds: torch.Tensor, selected_tokens: torch.Tensor,
+                                                   pruning_mask: torch.Tensor, original_video_tokens_per_frame: int,
+                                                   pruned_video_tokens_per_frame: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reconstruct inputs_embeds with pruned video embeddings using per-frame pruning information
+        
+        Args:
+            inputs_embeds: Input embeddings tensor [batch_size, seq_len, feature_dim]
+            input_ids: Input token IDs [batch_size, seq_len]
+            pruned_video_embeds: Pruned video embeddings [num_frames, pruned_token_per_frame, feature_dim]
+            selected_tokens: Selected token indices per frame [num_frames, selected_tokens_per_frame]
+            pruning_mask: Boolean mask indicating which tokens were kept per frame [num_frames, tokens_per_frame]
+            original_video_tokens_per_frame: Number of tokens per frame before pruning (int)
+            pruned_video_tokens_per_frame: Number of tokens per frame after pruning (int)
+            
+        Returns:
+            tuple containing:
+                - torch.Tensor: Reconstructed input embeddings with pruned video tokens [batch_size, new_seq_len, feature_dim]
+                - torch.Tensor: Removal mask indicating which original tokens were removed [batch_size, original_seq_len]
+            
+        Note:
+            Video tokens are organized as contiguous blocks per frame, but frames are separated by other content.
+            This function uses per-frame pruning information to precisely reconstruct the embedding sequence
+            with the correct pruned tokens for each video frame.
+        """
+        # Step 1: Validate inputs and extract video positions
+        num_frames, video_positions = self._validate_video_reconstruction_inputs(
+            inputs_embeds, input_ids, pruning_mask, original_video_tokens_per_frame
+        )
+        
+        # Step 2: Identify frame segments
+        frame_segments = self._identify_video_frame_segments(
+            video_positions, num_frames, original_video_tokens_per_frame
+        )
+        
+        # Step 3: Create removal mask
+        removal_mask = self._create_removal_mask(inputs_embeds, frame_segments, pruning_mask)
+        
+        # Step 4: Reconstruct embeddings with pruned frames
+        new_inputs_embeds = self._reconstruct_embeddings_with_pruned_frames(
+            inputs_embeds, frame_segments, pruned_video_embeds, pruned_video_tokens_per_frame
+        )
+        
+        return new_inputs_embeds, removal_mask
+    
+    def _apply_video_pruning(self, video_frame_results: list, text_embeddings: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply CDPruner to video embeddings with per-frame pruning
+        
+        Args:
+            video_frame_results: List of video frame embeddings [tokens_per_frame, feature_dim]
+            text_embeddings: Text embeddings for relevance calculation [text_length, feature_dim]
+            
+        Returns:
+            tuple containing:
+                - pruned_features: Pruned video embeddings [total_pruned_tokens, feature_dim]
+                - selected_tokens: Selected token indices [B, T]
+                - pruning_mask: Boolean mask indicating which tokens were kept [B, N]
+        """
+        # Stack all video frames: [num_frames, tokens_per_frame, feature_dim]
+        video_batch = torch.stack(video_frame_results, dim=0)
+        
+        # Apply CDPruner to get pruned features and selection information
+        pruned_features, selected_tokens, pruning_mask = self.cdpruner.prune_tokens(video_batch, text_embeddings)
+        
+        # Convert List formats to torch.Tensor if needed
+        # selected_tokens: List[List[int]] -> torch.Tensor [B, T]
+        if isinstance(selected_tokens, list):
+            # Pad sequences to same length and convert to tensor
+            max_length = max(len(seq) for seq in selected_tokens) if selected_tokens else 0
+            padded_selected_tokens = []
+            for seq in selected_tokens:
+                padded_seq = seq + [-1] * (max_length - len(seq))  # Pad with -1
+                padded_selected_tokens.append(padded_seq)
+            selected_tokens = torch.tensor(padded_selected_tokens, dtype=torch.long, device=pruned_features.device)
+        
+        # pruning_mask: List[bool] -> torch.Tensor [B, N]
+        if isinstance(pruning_mask, list):
+            pruning_mask = torch.tensor(pruning_mask, dtype=torch.bool, device=pruned_features.device)
+            
+            # Reshape from [B*N] to [B, N] where B is number of frames, N is tokens per frame
+            B = video_batch.shape[0]  # number of frames
+            N = len(pruning_mask) // B  # tokens per frame
+            pruning_mask = pruning_mask.view(B, N)
+        
+        return pruned_features, selected_tokens, pruning_mask
+    
     # Copied from https://github.com/huggingface/transformers/blob/v4.45.2/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py#L1602
     def _update_model_kwargs_for_generation(
         self,
@@ -1193,7 +1535,8 @@ class Token2WavProcessor:
 class OVQwen2_5OmniModel(GenerationMixin):
     def __init__(self, model_dir, thinker_device, talker_device, token2wav_device, enable_talker, 
                  thinker_max_prompt_len=1024, thinker_min_response_len=256,
-                 talker_max_prompt_len=1024, talker_min_response_len=256):
+                 talker_max_prompt_len=1024, talker_min_response_len=256,
+                 enable_cdpruner=False, cdpruner_num_visual_tokens=256, cdpruner_relevance_weight=0.5):
         """Initialize OVQwen2_5OmniModel with separate parameters for each LLM
         
         Args:
@@ -1206,10 +1549,29 @@ class OVQwen2_5OmniModel(GenerationMixin):
             thinker_min_response_len: Minimum response length for thinker LLM (default: 256)
             talker_max_prompt_len: Maximum prompt length for talker LLM (default: 1024)
             talker_min_response_len: Minimum response length for talker LLM (default: 256)
+            enable_cdpruner: Whether to enable CDPruner for video token pruning (default: False)
+            cdpruner_num_visual_tokens: Number of visual tokens to keep after pruning (default: 256)
+            cdpruner_relevance_weight: Weight for balancing relevance vs diversity (default: 0.5)
         """
         self.config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
         self.thinker_infer_device = thinker_device
         self.talker_infer_device = talker_device
+        
+        # CDPruner configuration
+        self.enable_cdpruner = enable_cdpruner
+        self.cdpruner_num_visual_tokens = cdpruner_num_visual_tokens
+        if self.enable_cdpruner:
+            from cdpruner.cdpruner import CDPruner
+            from cdpruner.cdpruner_config import Config as CDPrunerConfig
+            # Use the specified number of visual tokens directly
+            cdpruner_config = CDPrunerConfig(
+                num_visual_tokens=cdpruner_num_visual_tokens,
+                relevance_weight=cdpruner_relevance_weight,
+                enable_pruning=True,
+                device="CPU",
+                debug_mode=True
+            )
+            self.cdpruner = CDPruner(cdpruner_config)
         self.token2wav_infer_device = token2wav_device
         
         # Store parameters for each LLM separately
@@ -1227,6 +1589,12 @@ class OVQwen2_5OmniModel(GenerationMixin):
             model_path / "thinker", thinker_device, self.config, 
             self.thinker_max_prompt_len, self.thinker_min_response_len
         )
+        
+        # Configure CDPruner in thinker
+        self.thinker.enable_cdpruner = self.enable_cdpruner
+        if self.enable_cdpruner:
+            self.thinker.cdpruner = self.cdpruner
+            self.thinker.cdpruner_num_visual_tokens = self.cdpruner_num_visual_tokens
         
         # Initialize Talker and Token2Wav if enabled
         if self.has_talker:
