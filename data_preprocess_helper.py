@@ -4,17 +4,59 @@ import numpy as np
 import torch
 import os
 
+def _find_best_patch_grid(target_patches, aspect_ratio):
+    """Find the optimal patch grid dimensions that best match the aspect ratio."""
+    best_height_patches = 1
+    best_width_patches = target_patches
+    min_ratio_diff = float('inf')
+    
+    for i in range(1, int(math.sqrt(target_patches)) + 1):
+        if target_patches % i == 0:
+            height_patches = i
+            width_patches = target_patches // i
+            target_ratio = width_patches / height_patches
+            ratio_diff = abs(target_ratio - aspect_ratio)
+            
+            if ratio_diff < min_ratio_diff:
+                min_ratio_diff = ratio_diff
+                best_height_patches = height_patches
+                best_width_patches = width_patches
+    
+    return best_height_patches, best_width_patches
+
+def _resize_with_padding(img, target_width, target_height):
+    """Resize image with black padding and centering."""
+    orig_width, orig_height = img.size
+    
+    scale_w = target_width / orig_width
+    scale_h = target_height / orig_height
+    scale = min(scale_w, scale_h)
+    
+    resized_width = min(int(round(orig_width * scale)), target_width)
+    resized_height = min(int(round(orig_height * scale)), target_height)
+    
+    resized_img = img.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
+    
+    new_img = Image.new("RGB", (target_width, target_height), (0, 0, 0))
+    offset_x = (target_width - resized_width) // 2
+    offset_y = (target_height - resized_height) // 2
+    new_img.paste(resized_img, (offset_x, offset_y))
+    
+    return new_img
+
+def _resize_simple(img, max_pixel_area):
+    """Simple resize that only scales down, preserving aspect ratio."""
+    orig_width, orig_height = img.size
+    current_pixel_area = orig_width * orig_height
+    
+    scale = min(math.sqrt(max_pixel_area / current_pixel_area), 1.0)
+    new_width = int(round(orig_width * scale))
+    new_height = int(round(orig_height * scale))
+    
+    return img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
 def resize_audio_for_npu(audios, npu_static_length=163839):
-    """
-    Process audio data by padding or trimming to match the target length.
-
-    Args:
-        audios (list | None): Input audio data.
-        npu_static_length (int): The static length for NPU processing.
-
-    Returns:
-        list | None: Processed audio data, or None if input is None.
-    """
+    """Process audio data by padding or trimming to match the target length."""
     if audios is None:
         return None
     
@@ -25,27 +67,15 @@ def resize_audio_for_npu(audios, npu_static_length=163839):
     
     if len(audio) > npu_static_length:
         print(f"Warning: Audio data {len(audio)} exceeds the target length {npu_static_length}. It will be trimmed to the target size.")
-        trimmed_audio = audio[:npu_static_length]
-        return [trimmed_audio]
+        return [audio[:npu_static_length]]
     
     pad_length = npu_static_length - len(audio)
     padded_audio = np.concatenate([audio, np.zeros(pad_length, dtype=audio.dtype)])
-
     print(f"Warning: Audio data {len(audio)} smaller than the target length {npu_static_length}. It will be padding to the target size.")
     return [padded_audio]
 
 def resize_image_for_npu(imgs, patch_size=14, npu_static_patch_length=2048):
-    """
-    Resize images for NPU processing by maintaining aspect ratio and padding.
-
-    Args:
-        imgs (list | None): Input image list.
-        patch_size (int): Size of each patch.
-        npu_static_patch_length (int): The static length for NPU processing.
-
-    Returns:
-        list | None: List of resized and padded images, or None if input is None.
-    """
+    """Resize images for NPU processing with fixed patch count and black padding."""
     if imgs is None:
         return None
 
@@ -53,188 +83,123 @@ def resize_image_for_npu(imgs, patch_size=14, npu_static_patch_length=2048):
         raise ValueError("Input imgs must be a non-empty list.")
 
     resized_imgs = []
+    
     for img in imgs:
         orig_width, orig_height = img.size
-        orig_ratio = orig_width / orig_height
-
-        factor_pairs = [(2 ** i, npu_static_patch_length // (2 ** i)) for i in range(12)]  # Generate factor pairs
-
-        min_diff = float('inf')
-        best_a, best_b = 1, npu_static_patch_length
-        for a, b in factor_pairs:
-            current_ratio = b / a
-            diff = abs(current_ratio - orig_ratio)
-            if diff < min_diff:
-                min_diff = diff
-                best_a, best_b = a, b
-
-        target_width = patch_size * best_b
-        target_height = patch_size * best_a
-
-        scale = min(target_width / orig_width, target_height / orig_height)
-        new_width = int(round(orig_width * scale))
-        new_height = int(round(orig_height * scale))
-
-        resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-
-        new_img = Image.new("RGB", (target_width, target_height), (0, 0, 0))
-        new_img.paste(resized_img, (0, 0))
-
+        aspect_ratio = orig_width / orig_height
+        
+        best_height_patches, best_width_patches = _find_best_patch_grid(npu_static_patch_length, aspect_ratio)
+        
+        target_height = best_height_patches * patch_size
+        target_width = best_width_patches * patch_size
+        
+        new_img = _resize_with_padding(img, target_width, target_height)
+        
         print(f"Resize image: {orig_width}x{orig_height} -> {target_width}x{target_height} with patch number {npu_static_patch_length}")
-
         resized_imgs.append(new_img)
 
     return resized_imgs
 
-
-def resize_images_for_gpu(images, patch_size=14, target_patch_size_each_img=2048):
-    """
-    Resize a list of images for GPU processing by maintaining aspect ratio.
-
-    Args:
-        images (list of PIL.Image.Image | None): List of input images.
-        patch_size (int): Size of each patch.
-        target_patch_size_each_img (int): Target patch size for each image.
-
-    Returns:
-        list of numpy.ndarray | None: List of processed images or None if input is None.
-    """
+def resize_images_for_cpu_gpu(images, patch_size=14, target_patch_size_each_img=2048):
+    """Resize images for CPU/GPU processing with flexible patch count."""
     if images is None:
         return None
     
+    if not isinstance(images, list) or len(images) == 0:
+        raise ValueError("Input images must be a non-empty list.")
+    
     processed_images = []
+    max_pixel_area = target_patch_size_each_img * (patch_size ** 2)
+    
     for img in images:
-        H, W = img.size
-        
-        max_product = target_patch_size_each_img * (patch_size ** 2)
-        current_product = H * W
-        
-        scale = math.sqrt(max_product / current_product)
-        scale = min(scale, 1.0)
-        
-        new_H = int(round(H * scale))
-        new_W = int(round(W * scale))
-        
-        resized_img = img.resize((new_W, new_H), Image.Resampling.LANCZOS)
+        orig_width, orig_height = img.size
+        resized_img = _resize_simple(img, max_pixel_area)
+        new_width, new_height = resized_img.size
         
         processed_images.append(np.array(resized_img))
-
-        print(f"Resize image: {W}x{H} -> {new_W}x{new_H} with patch number {round(new_W*new_H/(patch_size ** 2))}")
+        
+        actual_patch_count = round(new_width * new_height / (patch_size ** 2))
+        print(f"Resize image: {orig_width}x{orig_height} -> {new_width}x{new_height} with patch number {actual_patch_count}")
 
     return processed_images
 
-def resize_videos_for_gpu(video_list, patch_size=14, target_patch_size_each_frame=2048):
-    """
-    Resize a video for GPU processing by maintaining aspect ratio.
-
-    Args:
-        video_list (list of torch.Tensor | None): List containing a single video tensor with shape (frames, channels, height, width).
-        patch_size (int): Size of each patch.
-        target_patch_size_each_frame (int): Target patch size for each frame.
-
-    Returns:
-        list of torch.Tensor | None: List containing the processed video tensor or None if input is None.
-    """
+def resize_videos_for_cpu_gpu(video_list, patch_size=14, target_patch_size_each_frame=2048):
+    """Resize video for CPU/GPU processing with flexible patch count per frame."""
     if video_list is None or len(video_list) == 0:
         return None
     
+    if not isinstance(video_list, list) or len(video_list) != 1:
+        raise ValueError("Input video_list must contain exactly one video tensor.")
+    
     video = video_list[0]
-    frames, channels, H, W = video.shape
+    frames, channels, orig_height, orig_width = video.shape
+    max_pixel_area = target_patch_size_each_frame * (patch_size ** 2)
+    
     processed_frames = []
-
-    max_product = target_patch_size_each_frame * (patch_size ** 2)
-    current_product = H * W
-    
-    scale = math.sqrt(max_product / current_product)
-    scale = min(scale, 1.0)
-    
-    new_H = int(round(H * scale))
-    new_W = int(round(W * scale))
     
     for i in range(frames):
-        frame = video[i].permute(1, 2, 0).numpy().astype(np.uint8)  # Convert to HWC format and ensure type is uint8
+        frame = video[i].permute(1, 2, 0).numpy().astype(np.uint8)
         img = Image.fromarray(frame)
-        resized_img = img.resize((new_W, new_H), Image.Resampling.LANCZOS)
-        processed_frames.append(torch.from_numpy(np.array(resized_img)).permute(2, 0, 1))  # Convert back to CHW format
         
-        print(f"Resize frame {i+1}/{frames}: {W}x{H} -> {new_W}x{new_H} with patch number {round(new_W*new_H/(patch_size ** 2))}")
+        resized_img = _resize_simple(img, max_pixel_area)
+        new_width, new_height = resized_img.size
+        
+        processed_frames.append(torch.from_numpy(np.array(resized_img)).permute(2, 0, 1))
+        
+        actual_patch_count = round(new_width * new_height / (patch_size ** 2))
+        print(f"Resize frame {i+1}/{frames}: {orig_width}x{orig_height} -> {new_width}x{new_height} with patch number {actual_patch_count}")
     
-    processed_video = torch.stack(processed_frames, dim=0)  # Stack frames back to video
-    return [processed_video]
+    return [torch.stack(processed_frames, dim=0)]
 
 def resize_videos_for_npu(video_list, patch_size=14, target_patch_size_each_frame=2048):
-    """
-    Resize a video for GPU processing by maintaining aspect ratio.
-
-    Args:
-        video_list (list of torch.Tensor | None): List containing a single video tensor with shape (frames, channels, height, width).
-        patch_size (int): Size of each patch.
-        target_patch_size_each_frame (int): Target patch size for each frame.
-
-    Returns:
-        list of torch.Tensor | None: List containing the processed video tensor or None if input is None.
-    """
+    """Resize video for NPU processing with fixed patch count and black padding."""
     if video_list is None or len(video_list) == 0:
         return None
     
     video = video_list[0]
     frames, channels, orig_height, orig_width = video.shape
+    aspect_ratio = orig_width / orig_height
+    
+    best_height_patches, best_width_patches = _find_best_patch_grid(target_patch_size_each_frame, aspect_ratio)
+    
+    target_height = best_height_patches * patch_size
+    target_width = best_width_patches * patch_size
+    
     processed_frames = []
-
-    orig_ratio = orig_width / orig_height
-
-    factor_pairs = [(2 ** i, 2048 // (2 ** i)) for i in range(12)]  # Generate factor pairs from 2^0 to 2^11
-
-    min_diff = float('inf')
-    best_a, best_b = 1, target_patch_size_each_frame
-    for a, b in factor_pairs:
-        current_ratio = b / a
-        diff = abs(current_ratio - orig_ratio)
-        if diff < min_diff:
-            min_diff = diff
-            best_a, best_b = a, b
-
-    target_width = patch_size * best_b
-    target_height = patch_size * best_a
-
-    scale = min(target_width / orig_width, target_height / orig_height)
-    new_W = int(round(orig_width * scale))
-    new_H = int(round(orig_height * scale))
+    os.makedirs('inputs/video_imgs', exist_ok=True)
     
     for i in range(frames):
-        frame = video[i].permute(1, 2, 0).numpy().astype(np.uint8)  # Convert to HWC format and ensure type is uint8
+        frame = video[i].permute(1, 2, 0).numpy().astype(np.uint8)
         img = Image.fromarray(frame)
-        resized_img = img.resize((new_W, new_H), Image.Resampling.LANCZOS)
-
-        new_img = Image.new("RGB", (target_width, target_height), (0, 0, 0))
-        new_img.paste(resized_img, (0, 0))
-
-        processed_frames.append(torch.from_numpy(np.array(new_img)).permute(2, 0, 1))  # Convert back to CHW format
         
-        # Save the frame to the output folder
+        new_img = _resize_with_padding(img, target_width, target_height)
+        
+        processed_frames.append(torch.from_numpy(np.array(new_img)).permute(2, 0, 1))
+        
         frame_filename = os.path.join('inputs/video_imgs', f"frame_{i+1:04d}.png")
         new_img.save(frame_filename)
 
-        print(f"Resize frame {i+1}/{frames}: {orig_width}x{orig_height} -> {new_W}x{new_H} ({target_width}x{target_height}) with patch number {round(target_width*target_height/(patch_size ** 2))}")
+        print(f"Resize frame {i+1}/{frames}: {orig_width}x{orig_height} -> {target_width}x{target_height} with patch number {target_patch_size_each_frame}")
     
-    processed_video = torch.stack(processed_frames, dim=0)  # Stack frames back to video
-    return [processed_video]
+    return [torch.stack(processed_frames, dim=0)]
 
 def resize_inputs(audios, images, videos, audio_len, img_patch_size, patch_length_per_img, device):
+    """Main entry point for resizing all input types based on device."""
     if device == "NPU":
-        audios = resize_audio_for_npu(audios, npu_static_length = audio_len)
-        images = resize_image_for_npu(images, patch_size = img_patch_size, npu_static_patch_length = patch_length_per_img)
-        videos = resize_videos_for_npu(videos, patch_size=img_patch_size, target_patch_size_each_frame = patch_length_per_img)
-
-    if device != "NPU":
-        images = resize_images_for_gpu(images, patch_size=img_patch_size, target_patch_size_each_img = patch_length_per_img)
-        videos = resize_videos_for_gpu(videos, patch_size=img_patch_size, target_patch_size_each_frame = patch_length_per_img)
+        audios = resize_audio_for_npu(audios, npu_static_length=audio_len)
+        images = resize_image_for_npu(images, patch_size=img_patch_size, npu_static_patch_length=patch_length_per_img)
+        videos = resize_videos_for_npu(videos, patch_size=img_patch_size, target_patch_size_each_frame=patch_length_per_img)
+    else:  # CPU or GPU
+        images = resize_images_for_cpu_gpu(images, patch_size=img_patch_size, target_patch_size_each_img=patch_length_per_img)
+        videos = resize_videos_for_cpu_gpu(videos, patch_size=img_patch_size, target_patch_size_each_frame=patch_length_per_img)
 
     return audios, images, videos
 
 def dump_inputs_info(inputs):
+    """Print detailed information about processed inputs."""
     print("=== Inputs Informations ===")
     print(f"key values: {inputs.keys()}")
+    
     for key, value in inputs.items():
         print(f"\n{key} shape: {value.shape}")
         if hasattr(value, 'dtype'):
