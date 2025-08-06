@@ -1413,12 +1413,30 @@ class OVQwen2_5OmniTalkerForConditionalGeneration(GenerationMixin):
 class Token2WavProcessor:
     """Token2Wav processing utilities"""
     
-    def __init__(self, token2wav_dit_model, token2wav_bigvgan_model, device: str, config):
+    def __init__(self, token2wav_dit_model, token2wav_bigvgan_model, device: str, config, enable_realtime_playback: bool = True, sample_rate: int = 24000):
         self.token2wav_dit = token2wav_dit_model
         self.token2wav_bigvgan = token2wav_bigvgan_model
         self.device = device
         self.config = config
+        self.sample_rate = sample_rate
         
+        # Simple real-time playback - always enabled
+        import sounddevice as sd
+        print(f"[Token2wav] Real-time playback enabled (sample_rate={self.sample_rate})")
+    
+    def _play_audio_chunk(self, waveform: torch.Tensor):
+        """Play audio chunk immediately"""
+        try:
+            import sounddevice as sd
+            # Convert to numpy format
+            audio_data = waveform.squeeze().cpu().float().numpy().astype(np.float32)
+            if len(audio_data) > 0:
+                # Play immediately without waiting for completion
+                sd.play(audio_data, samplerate=self.sample_rate)
+                print(f"[Token2wav] Playing chunk: {len(audio_data)} samples")
+        except Exception as e:
+            print(f"[Token2wav] Playback error: {e}")
+    
     def process_codes_to_audio(self, talker_generate_codes: torch.Tensor, speaker_params: Dict) -> torch.Tensor:
         """Convert talker generated codes to audio waveform"""
         original_length = talker_generate_codes.shape[1]
@@ -1450,15 +1468,25 @@ class Token2WavProcessor:
 
             # Process current chunk
             chunk_waveform = self._process_single_chunk(current_chunk, speaker_params, chunk_idx + 1, num_chunks, current_chunk_length if needs_padding else None)
+            
+            # Play this chunk immediately
+            self._play_audio_chunk(chunk_waveform)
+            
             waveform_chunks.append(chunk_waveform)
         
-        # Concatenate all waveform chunks
+        # Concatenate all waveform chunks for return value
         if len(waveform_chunks) == 1:
             final_waveform = waveform_chunks[0]
         else:
             final_waveform = torch.cat(waveform_chunks, dim=-1)  # Concatenate along time dimension
         
         print(f"[Token2wav][{self.device}] Final waveform shape: {final_waveform.shape}")
+        
+        # Wait 2 seconds for audio playback to complete
+        import time
+        time.sleep(2.5)
+        print(f"[Token2wav] Finished 2.5-second wait")
+        
         return final_waveform.squeeze().cpu().float()
 
     def _process_single_chunk(self, talker_generate_codes: torch.Tensor, speaker_params: Dict, chunk_idx: int, total_chunks: int, original_length: int = None) -> torch.Tensor:
@@ -1605,8 +1633,16 @@ class OVQwen2_5OmniModel(GenerationMixin):
         spk_path = model_path / "spk_dict.pt"
         self.load_speakers(spk_path)
 
-    def enable_talker(self, model_path, talker_device, token2wav_device=None):
-        """Enable talker and token2wav functionality"""
+    def enable_talker(self, model_path, talker_device, token2wav_device=None, enable_realtime_playback=True, sample_rate=24000):
+        """Enable talker and token2wav functionality
+        
+        Args:
+            model_path: Path to model directory
+            talker_device: Device for talker model
+            token2wav_device: Device for token2wav models (defaults to talker_device)
+            enable_realtime_playback: Whether to enable real-time audio playback
+            sample_rate: Sample rate for audio playback (default: 22050)
+        """
         if token2wav_device is None:
             token2wav_device = talker_device
             
@@ -1640,9 +1676,10 @@ class OVQwen2_5OmniModel(GenerationMixin):
                 model_path / TOKEN2WAV_BIGVGAN_NAME, token2wav_device, 'token2wav_bigvgan'
             )
             
-        # Initialize Token2Wav processor
+        # Initialize Token2Wav processor with real-time playback support
         self.token2wav_processor = Token2WavProcessor(
-            token2wav_dit, token2wav_bigvgan, token2wav_device, self.config
+            token2wav_dit, token2wav_bigvgan, token2wav_device, self.config,
+            enable_realtime_playback=enable_realtime_playback, sample_rate=sample_rate
         )
         
         self.has_talker = True
