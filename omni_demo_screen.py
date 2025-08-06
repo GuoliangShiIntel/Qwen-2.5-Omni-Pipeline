@@ -24,20 +24,20 @@ import queue
 print("=== Compile And Load Models to Device ===")
 
 thinker_device = "NPU"
-talker_device = "GPU"
-token2wav_device = "CPU"
+talker_device = "NPU"
+token2wav_device = "NPU"
 
 enable_talker = False
 use_audio_in_video = False
 frame_selection_enabled = True  # Set to True to select only 2nd and 4th frames
 selected_frame_indices = [1, 3]  # 0-based indices: [1, 3] means 2nd and 4th frames
 
-model_id = "Qwen/Qwen2.5-Omni-3B-INT4-SYM"
+model_id = "Qwen/Qwen2.5-Omni-3B-NF4"
 model_dir = Path(model_id.split("/")[-1])
 
 ov_model = OVQwen2_5OmniModel(model_dir, thinker_device=thinker_device, talker_device=talker_device, token2wav_device=token2wav_device, 
                               enable_talker=enable_talker, thinker_max_prompt_len=2048, thinker_min_response_len=256,
-                              talker_max_prompt_len=1024, talker_min_response_len=256,
+                              talker_max_prompt_len=2048, talker_min_response_len=2048,
                               enable_cdpruner=True, cdpruner_num_visual_tokens=256, cdpruner_relevance_weight=0.5)
 
 processor = Qwen2_5OmniProcessor.from_pretrained(model_dir)
@@ -423,9 +423,12 @@ conversation = [
         #                             "4. 性能比较 ：请详细描述论文中的性能比较部分，包括比较的指标、方法和结果。"
         #                             "请确保描述中包含所有细节，并且每个部分都清晰明了。"},
         # ],
+        # "content": [
+        #     {"type": "text", "text": "请详细描述你看到的所有内容，包括且不限于："
+        #      "1. 打印出所有的文字；2.详细解释图片中的信息和细节；"},
+        # ],
         "content": [
-            {"type": "text", "text": "请详细描述你看到的所有内容，包括且不限于："
-             "1. 打印出所有的文字；2.详细解释图片中的信息和细节；"},
+            {"type": "text", "text": "请简要描述你看到的内容"},
         ],
     },
 ]
