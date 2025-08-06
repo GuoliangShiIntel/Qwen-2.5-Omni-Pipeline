@@ -3,7 +3,8 @@ from model_convert_helper import convert_qwen2_5_omni_model
 import nncf
 from pathlib import Path
 
-model_id = "Qwen/Qwen2.5-Omni-7B"
+# model_id = "Qwen/Qwen2.5-Omni-7B"
+model_id = "Qwen/Qwen2.5-Omni-3B"
 model_dir = Path(model_id.split("/")[-1])
 
 # compression_configuration = {"mode": nncf.CompressWeightsMode.INT4_SYM,
