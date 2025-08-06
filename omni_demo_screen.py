@@ -32,7 +32,7 @@ use_audio_in_video = False
 frame_selection_enabled = True  # Set to True to select only 2nd and 4th frames
 selected_frame_indices = [1, 3]  # 0-based indices: [1, 3] means 2nd and 4th frames
 
-model_id = "Qwen/Qwen2.5-Omni-3B-NF4"
+model_id = "Qwen/Qwen2.5-Omni-3B-INT4-SYM"
 model_dir = Path(model_id.split("/")[-1])
 
 ov_model = OVQwen2_5OmniModel(model_dir, thinker_device=thinker_device, talker_device=talker_device, token2wav_device=token2wav_device, 
@@ -313,7 +313,7 @@ def process_video_segment(frames, width, height):
         if frame_selection_enabled and videos is not None:
             videos = select_video_frames(videos, selected_frame_indices)
         
-        audios, images, videos = preprocess.resize_inputs(audios, images, videos, audio_len=163839, img_patch_size=14, patch_length_per_img=2048, device=get_pytorch_device(thinker_device))
+        audios, images, videos = preprocess.resize_inputs(audios, images, videos, audio_len=163839, img_patch_size=14, patch_length_per_img=2048, device=thinker_device)
         
         # Get processor inputs
         inputs = processor(text="", audio=audios, videos=videos, return_tensors="pt", padding=True, use_audio_in_video=use_audio_in_video)
@@ -365,7 +365,7 @@ def process_conversation(conversation, preprocessed_video_embeds=None):
     print(text)
 
     audios, images, videos = process_mm_info(conversation, use_audio_in_video=use_audio_in_video)
-    audios, images, videos = preprocess.resize_inputs(audios, images, videos, audio_len=163839, img_patch_size=14, patch_length_per_img=2048, device=get_pytorch_device(thinker_device))
+    audios, images, videos = preprocess.resize_inputs(audios, images, videos, audio_len=163839, img_patch_size=14, patch_length_per_img=2048, device=thinker_device)
 
     inputs = processor(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True, use_audio_in_video=use_audio_in_video)
 
@@ -425,7 +425,7 @@ conversation = [
         # ],
         "content": [
             {"type": "text", "text": "请详细描述你看到的所有内容，包括且不限于："
-             "1. 打印出所有的文字；2.详细解释图片中的架构和细节；3.详细解释图标中的数据，并给出具体值；4.做一个综述总结；每一条为一个段落"},
+             "1. 打印出所有的文字；2.详细解释图片中的信息和细节；"},
         ],
     },
 ]
