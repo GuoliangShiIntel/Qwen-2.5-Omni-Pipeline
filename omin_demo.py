@@ -24,7 +24,7 @@ conversation = [
         "content": [
             # {"type": "text", "text": "Based on the content you have seen, what do you think I am doing?"},
             # {"type": "text", "text": "These are the changes on the user's screen. What is the user's behavior?"},
-            {"type": "text", "text": "你从图片里面看到了什么？"},
+            {"type": "text", "text": "what is the title of this slice?"},
             {"type": "image", "image": "inputs/user_behavior0_resize.png"},
             # {"type": "image", "image": "inputs/user_behavior1_resize.png"},
             # {"type": "image", "image": "inputs/user_behavior2_resize.png"},
@@ -62,7 +62,8 @@ preprocess.dump_inputs_info(inputs)
 print("=== Infer and get Result ===")
 ov_model = OVQwen2_5OmniModel(model_dir, thinker_device=thinker_device, talker_device=talker_device, token2wav_device=token2wav_device, 
                               enable_talker=enable_talker, thinker_max_prompt_len=1024, thinker_min_response_len=256,
-                               talker_max_prompt_len=1024, talker_min_response_len=1024)
+                              talker_max_prompt_len=1024, talker_min_response_len=1024,
+                              enable_cdpruner=True, cdpruner_num_visual_tokens=256, cdpruner_relevance_weight=0.5)
 
 if not enable_talker:
     text_ids = ov_model.generate(
