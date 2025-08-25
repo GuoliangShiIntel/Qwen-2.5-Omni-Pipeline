@@ -214,3 +214,147 @@ def dump_inputs_info(inputs):
         print(f" - Vision Embedding include: {inputs['image_grid_thw'].size(0)} images")
     if 'feature_attention_mask' in inputs:
         print(f" - Audio Embedding input length: {inputs['feature_attention_mask'].sum(-1)}, output token length: {inputs['feature_attention_mask'].sum(-1)/4}")
+
+
+# Dataset helpers for calibration
+import nncf
+from typing import Optional
+
+def check_wikitext2_availability():
+    """Check if wikitext2 dataset is available locally or can be downloaded."""
+    try:
+        from datasets import load_dataset
+        return True
+    except ImportError:
+        print("⚠️ 'datasets' library not found. Install with: pip install datasets")
+        return False
+
+def get_wikitext2_dataset(model_id: str, num_samples: int = 128) -> Optional[nncf.Dataset]:
+    """
+    Get wikitext2 dataset for calibration.
+    
+    Args:
+        model_id: Model identifier for tokenizer
+        num_samples: Number of samples to use for calibration
+        
+    Returns:
+        NNCF Dataset object or None if unavailable
+    """
+    if not check_wikitext2_availability():
+        return None
+    
+    try:
+        from datasets import load_dataset
+        from transformers import AutoTokenizer
+        
+        # Try to load wikitext2 dataset
+        print("⌛ Downloading/loading wikitext2 dataset...")
+        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+        
+        # Load tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        def prepare_input(example):
+            """Prepare input for the model."""
+            text = example["text"]
+            if not text or len(text.strip()) < 10:  # Skip empty or very short texts
+                return None
+            
+            # Tokenize text
+            inputs = tokenizer(
+                text,
+                max_length=512,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt"
+            )
+            
+            # Return inputs in the format expected by the model
+            return {
+                "input_ids": inputs["input_ids"].squeeze(0),
+                "attention_mask": inputs["attention_mask"].squeeze(0)
+            }
+        
+        def data_generator():
+            """Generate calibration data."""
+            count = 0
+            for example in dataset:
+                if count >= num_samples:
+                    break
+                    
+                prepared = prepare_input(example)
+                if prepared is not None:
+                    # For embedding layer, we only need input_ids
+                    yield prepared["input_ids"].unsqueeze(0)  # Add batch dimension
+                    count += 1
+        
+        # Create NNCF dataset
+        calibration_dataset = nncf.Dataset(data_generator)
+        print(f"✅ Created calibration dataset with {num_samples} samples")
+        
+        return calibration_dataset
+        
+    except Exception as e:
+        print(f"❌ Error loading wikitext2 dataset: {e}")
+        
+        # Try to use a simple text dataset as fallback
+        print("⌛ Creating fallback calibration dataset...")
+        return create_fallback_dataset(model_id, num_samples)
+
+def create_fallback_dataset(model_id: str, num_samples: int = 128) -> Optional[nncf.Dataset]:
+    """
+    Create a simple fallback calibration dataset using predefined texts.
+    
+    Args:
+        model_id: Model identifier for tokenizer
+        num_samples: Number of samples to generate
+        
+    Returns:
+        NNCF Dataset object or None
+    """
+    try:
+        from transformers import AutoTokenizer
+        
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        # Sample texts for calibration
+        sample_texts = [
+            "The quick brown fox jumps over the lazy dog.",
+            "Machine learning is a subset of artificial intelligence.",
+            "Natural language processing enables computers to understand human language.",
+            "Deep learning models require large amounts of training data.",
+            "Computer vision helps machines interpret and understand visual information.",
+            "Artificial intelligence is transforming various industries worldwide.",
+            "Neural networks are inspired by the structure of the human brain.",
+            "Data science combines statistics, computer science, and domain expertise.",
+            "Cloud computing provides on-demand access to computing resources.",
+            "Cybersecurity protects digital systems from malicious attacks.",
+        ]
+        
+        def data_generator():
+            """Generate calibration data from sample texts."""
+            for i in range(num_samples):
+                text = sample_texts[i % len(sample_texts)]
+                
+                inputs = tokenizer(
+                    text,
+                    max_length=128,
+                    truncation=True,
+                    padding="max_length",
+                    return_tensors="pt"
+                )
+                
+                yield inputs["input_ids"].squeeze(0).unsqueeze(0)  # Add batch dimension
+        
+        calibration_dataset = nncf.Dataset(data_generator)
+        print(f"✅ Created fallback calibration dataset with {num_samples} samples")
+        
+        return calibration_dataset
+        
+    except Exception as e:
+        print(f"❌ Error creating fallback dataset: {e}")
+        return None

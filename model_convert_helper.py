@@ -221,7 +221,7 @@ TOKEN2WAV_DIT_NAME = "openvino_token2wav_dit_model.xml"
 TOKEN2WAV_BIGVGAN_NAME = "openvino_token2wav_bigvgan_model.xml"
 
 
-def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None, use_local_dir=False):
+def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None, calibration_dataset=None, use_local_dir=False):
     thinker_output_dir = Path(output_dir) / "thinker"
     talker_output_dir = Path(output_dir) / "talker"
 
@@ -591,8 +591,39 @@ def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None, u
 
         if quantization_config is not None:
             print(f"⌛ Weights compression with {quantization_config['mode']} mode started")
-            ov_model = nncf.compress_weights(ov_model, **quantization_config)
-            print("✅ Weights compression finished")
+            
+            # Use dataset-aware quantization for NF4 if calibration dataset is provided
+            if (quantization_config.get('mode') == nncf.CompressWeightsMode.NF4 and 
+                calibration_dataset is not None):
+                print("⌛ Using dataset-aware quantization with wikitext2 calibration data")
+                
+                # Create a copy of quantization_config without custom parameters
+                quant_config = quantization_config.copy()
+                
+                # Remove custom parameters that are not part of NNCF API
+                awq_enabled = quant_config.pop('awq', False)
+                scale_estimation_enabled = quant_config.pop('scale_estimation', False)
+                
+                print(f"   - AWQ enabled: {awq_enabled}")
+                print(f"   - Scale estimation enabled: {scale_estimation_enabled}")
+                
+                try:
+                    # Try with dataset-aware quantization
+                    ov_model = nncf.compress_weights(ov_model, dataset=calibration_dataset, **quant_config)
+                    print("✅ Dataset-aware weights compression finished")
+                except Exception as e:
+                    print(f"⚠️ Dataset-aware quantization failed: {e}")
+                    print("⌛ Falling back to standard quantization...")
+                    ov_model = nncf.compress_weights(ov_model, **quant_config)
+                    print("✅ Standard weights compression finished")
+            else:
+                # Standard quantization without dataset
+                quant_config = quantization_config.copy()
+                # Remove custom parameters
+                quant_config.pop('awq', None)
+                quant_config.pop('scale_estimation', None)
+                ov_model = nncf.compress_weights(ov_model, **quant_config)
+                print("✅ Weights compression finished")
 
         ov.save_model(ov_model, thinker_lang_path)
         del ov_model
@@ -722,8 +753,39 @@ def convert_qwen2_5_omni_model(model_id, output_dir, quantization_config=None, u
 
         if quantization_config is not None:
             print(f"⌛ Weights compression with {quantization_config['mode']} mode started")
-            ov_model = nncf.compress_weights(ov_model, **quantization_config)
-            print("✅ Weights compression finished")
+            
+            # Use dataset-aware quantization for NF4 if calibration dataset is provided
+            if (quantization_config.get('mode') == nncf.CompressWeightsMode.NF4 and 
+                calibration_dataset is not None):
+                print("⌛ Using dataset-aware quantization with wikitext2 calibration data")
+                
+                # Create a copy of quantization_config without custom parameters
+                quant_config = quantization_config.copy()
+                
+                # Remove custom parameters that are not part of NNCF API
+                awq_enabled = quant_config.pop('awq', False)
+                scale_estimation_enabled = quant_config.pop('scale_estimation', False)
+                
+                print(f"   - AWQ enabled: {awq_enabled}")
+                print(f"   - Scale estimation enabled: {scale_estimation_enabled}")
+                
+                try:
+                    # Try with dataset-aware quantization
+                    ov_model = nncf.compress_weights(ov_model, dataset=calibration_dataset, **quant_config)
+                    print("✅ Dataset-aware weights compression finished")
+                except Exception as e:
+                    print(f"⚠️ Dataset-aware quantization failed: {e}")
+                    print("⌛ Falling back to standard quantization...")
+                    ov_model = nncf.compress_weights(ov_model, **quant_config)
+                    print("✅ Standard weights compression finished")
+            else:
+                # Standard quantization without dataset
+                quant_config = quantization_config.copy()
+                # Remove custom parameters
+                quant_config.pop('awq', None)
+                quant_config.pop('scale_estimation', None)
+                ov_model = nncf.compress_weights(ov_model, **quant_config)
+                print("✅ Weights compression finished")
 
         ov.save_model(ov_model, talker_lang_path)
         del ov_model
